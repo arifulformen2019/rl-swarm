@@ -299,30 +299,39 @@ setup_modal_login() {
     log_info "Started server process: $SERVER_PID"
     sleep 5
     
-    # Try to setup cloudflared tunnel
-    if try_cloudflared; then
-        log_info "Cloudflared tunnel is available at: $FORWARDING_URL"
-    else
-        log_warn "Cloudflared tunnel setup failed, falling back to localhost"
-    fi
+    # Check if userData.json already exists
+    local user_data_file="$ROOT/modal-login/temp-data/userData.json"
     
-    # Open browser
-    if [[ -z "$DOCKER" ]]; then
-        local url_to_open="http://localhost:3000"
-        if [[ -n "$FORWARDING_URL" ]]; then
-            url_to_open="$FORWARDING_URL"
+    if [[ ! -f "$user_data_file" ]]; then
+        log_info "userData.json not found. Setting up cloudflared tunnel..."
+        
+        # Try to setup cloudflared tunnel only if userData.json doesn't exist
+        if try_cloudflared; then
+            log_info "Cloudflared tunnel is available at: $FORWARDING_URL"
+        else
+            log_warn "Cloudflared tunnel setup failed, falling back to localhost"
         fi
         
-        if open "$url_to_open" 2> /dev/null; then
-            log_info "Successfully opened $url_to_open in your default browser"
+        # Open browser
+        if [[ -z "$DOCKER" ]]; then
+            local url_to_open="http://localhost:3000"
+            if [[ -n "$FORWARDING_URL" ]]; then
+                url_to_open="$FORWARDING_URL"
+            fi
+            
+            if open "$url_to_open" 2> /dev/null; then
+                log_info "Successfully opened $url_to_open in your default browser"
+            else
+                log_warn "Failed to open $url_to_open. Please open it manually"
+            fi
         else
-            log_warn "Failed to open $url_to_open. Please open it manually"
+            log_info "Please open http://localhost:3000 in your host browser"
+            if [[ -n "$FORWARDING_URL" ]]; then
+                log_info "Or use the cloudflared tunnel: $FORWARDING_URL"
+            fi
         fi
     else
-        log_info "Please open http://localhost:3000 in your host browser"
-        if [[ -n "$FORWARDING_URL" ]]; then
-            log_info "Or use the cloudflared tunnel: $FORWARDING_URL"
-        fi
+        log_info "userData.json already exists. Skipping cloudflared setup."
     fi
     
     cd ..
@@ -541,8 +550,6 @@ main() {
     
     while true; do
         log_info "Starting swarm launcher..."
-        pkill -f "python.*rgym_exp.runner.swarm_launcher" 2>/tmp/swarm_launcher_pkill.log || true
-        sleep 1
         # Run the swarm launcher
         python -m rgym_exp.runner.swarm_launcher \
             --config-path "$ROOT/rgym_exp/config" \
