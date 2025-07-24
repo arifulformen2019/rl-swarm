@@ -70,7 +70,7 @@ game_manager:
   data_manager:
     _target_: rgym_exp.src.data.ReasoningGymDataManager
     yaml_config_path: "rgym_exp/src/datasets.yaml"
-    num_train_samples: 1
+    num_train_samples: 2
     num_evaluation_samples: 0
     num_generations: ${training.num_generations}
     system_prompt_id: 'default'
@@ -96,3 +96,4 @@ default_large_model_pool:
 
 default_small_model_pool:
   - Gensyn/Qwen2.5-0.5B-Instruct
+  - Qwen/Qwen3-0.6B
