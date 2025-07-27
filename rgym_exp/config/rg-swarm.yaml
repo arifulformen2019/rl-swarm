@@ -90,6 +90,7 @@ game_manager:
     modal_proxy_url: ${blockchain.modal_proxy_url}
     
 default_large_model_pool: 
-  - Qwen/Qwen3-0.6B
+  - dnotitia/Smoothie-Qwen3-1.7B
+  - Gensyn/Qwen2.5-1.5B-Instruct
 default_small_model_pool:
   - Gensyn/Qwen2.5-0.5B-Instruct
