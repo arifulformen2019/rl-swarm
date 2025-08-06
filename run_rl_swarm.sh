@@ -386,7 +386,7 @@ install_python_deps() {
     local packages=(
         "gensyn-genrl==0.1.4"
         "reasoning-gym>=0.1.20"
-        "trl"
+        "trl==0.19.1"
         "hivemind@git+https://github.com/gensyn-ai/hivemind@639c964a8019de63135a2594663b5bec8e5356dd"
     )
     
