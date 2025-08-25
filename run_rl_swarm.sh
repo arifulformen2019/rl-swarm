@@ -3,7 +3,7 @@
 # Removed set -euo pipefail for better error handling and process management
 
 # =============================================================================
-# RL-Swarm Launcher Script - Improved Version with Cloudflared
+# RL-Swarm Launcher Script - Enhanced Version with Error Monitoring
 # =============================================================================
 
 # Configuration
@@ -116,6 +116,28 @@ setup_docker_volumes() {
             fi
         done
     fi
+}
+
+# Enhanced system limits setup
+setup_system_limits() {
+    log_info "Setting up system limits to prevent resource errors..."
+    
+    # Increase file descriptor limits
+    ulimit -n 65536 2>/dev/null || {
+        log_warn "Failed to increase file descriptor limit"
+    }
+    
+    # Increase process limits
+    ulimit -u 32768 2>/dev/null || {
+        log_warn "Failed to increase process limit"
+    }
+    
+    # Set memory overcommit to prevent allocation failures
+    echo 1 | sudo tee /proc/sys/vm/overcommit_memory >/dev/null 2>&1 || {
+        log_debug "Could not set memory overcommit (may need sudo)"
+    }
+    
+    log_info "System limits configured"
 }
 
 # =============================================================================
@@ -479,17 +501,87 @@ setup_config() {
 }
 
 # =============================================================================
-# Error Handling and Cleanup
+# Enhanced Error Handling and Process Management
 # =============================================================================
+
+# Kill existing swarm processes with better detection
+kill_existing_swarm() {
+    log_warn "Killing existing swarm launcher processes..."
+    
+    # Kill by process name pattern
+    pkill -9 -f rgym_exp.runner.swarm_launcher 2>/dev/null || true
+    
+    # Kill related Python processes that might be stuck
+    pkill -9 -f "hivemind.*dht" 2>/dev/null || true
+    pkill -9 -f "python.*swarm" 2>/dev/null || true
+    
+    # Wait and verify
+    sleep 3
+    
+    # Double check and force kill if needed
+    local remaining_pids=$(pgrep -f rgym_exp.runner.swarm_launcher 2>/dev/null || true)
+    if [[ -n "$remaining_pids" ]]; then
+        log_warn "Force killing remaining processes: $remaining_pids"
+        echo "$remaining_pids" | xargs -r kill -9 2>/dev/null || true
+    fi
+    
+    log_info "Process cleanup completed"
+}
+
+# Monitor process and logs for errors
+monitor_swarm_process() {
+    local swarm_pid=$1
+    local log_file="$2"
+    local error_patterns=(
+        "EOFError: Ran out of input"
+        "BlockingIOError.*Resource temporarily unavailable"
+        "hivemind.dht.dht._run.*ERROR"
+        "Process DHT.*Traceback"
+        "Connection refused"
+        "CUDA out of memory"
+        "RuntimeError.*NCCL"
+        "\[Errno 11\] Resource temporarily unavailable"
+        "Failed to start DHT"
+        "DHT.*died unexpectedly"
+    )
+    
+    log_info "Starting process monitor for PID: $swarm_pid"
+    
+    while kill -0 $swarm_pid 2>/dev/null; do
+        # Check for error patterns in recent logs
+        if [[ -f "$log_file" ]]; then
+            for pattern in "${error_patterns[@]}"; do
+                if tail -n 100 "$log_file" | grep -E "$pattern" >/dev/null 2>&1; then
+                    log_error "Detected error pattern: $pattern"
+                    log_warn "Killing swarm process due to error..."
+                    kill_existing_swarm
+                    return 1
+                fi
+            done
+        fi
+        
+        # Check system resources
+        local mem_usage=$(free | grep Mem | awk '{print int($3/$2 * 100)}' 2>/dev/null || echo "0")
+        if [[ $mem_usage -gt 90 ]]; then
+            log_warn "High memory usage detected: ${mem_usage}%"
+        fi
+        
+        sleep 5
+    done
+    
+    return 0
+}
 
 # Handle interruption signals
 handle_interrupt() {
     log_warn "Received interrupt signal (Ctrl+C)..."
+    kill_existing_swarm
     cleanup
 }
 
 cleanup() {
     log_info "Shutting down trainer..."
+    kill_existing_swarm
     cleanup_cloudflared
     cleanup_server
     exit 0
@@ -508,7 +600,7 @@ display_banner() {
     ██   ██ ██                 ██ ██ ███ ██ ██   ██ ██   ██ ██  ██  ██
     ██   ██ ███████       ███████  ███ ███  ██   ██ ██   ██ ██      ██
 
-    From Gensyn - Noah Version
+    From Gensyn - Noah Version with Enhanced Error Handling
 
 EOF
     echo -e "$RESET_TEXT"
@@ -523,6 +615,7 @@ main() {
     display_banner
     init_directories
     setup_docker_volumes
+    setup_system_limits
     
     # Testnet connection setup
     if [[ "$CONNECT_TO_TESTNET" == "true" ]]; then
@@ -545,29 +638,100 @@ main() {
     log_info "Good luck in the swarm!"
     log_debug "Remember to star the repo on GitHub! --> https://github.com/gensyn-ai/rl-swarm"
     
-    # Launch the swarm with restart capability
-    log_info "Launching RL-Swarm with auto-restart..."
+    # Launch the swarm with enhanced monitoring
+    log_info "Launching RL-Swarm with enhanced error monitoring..."
+    
+    local restart_count=0
+    local max_quick_restarts=5
+    local quick_restart_threshold=30
+    local total_restarts=0
     
     while true; do
-        log_info "Starting swarm launcher..."
-        # Run the swarm launcher
+        local start_time=$(date +%s)
+        
+        # Kill any existing processes before starting
+        if [[ $restart_count -gt 0 ]]; then
+            log_info "Cleaning up before restart #$restart_count..."
+            kill_existing_swarm
+            
+            # Add progressive delay for repeated failures
+            local delay=$((10 + restart_count * 5))
+            if [[ $delay -gt 60 ]]; then
+                delay=60
+            fi
+            log_info "Waiting $delay seconds before restart..."
+            sleep $delay
+        fi
+        
+        log_info "Starting swarm launcher (attempt #$((total_restarts + 1)))..."
+        
+        # Create log file for this run
+        local current_log="$LOG_DIR/swarm_run_$(date +%Y%m%d_%H%M%S).log"
+        
+        # Start the swarm launcher in background with logging
         python -m rgym_exp.runner.swarm_launcher \
             --config-path "$ROOT/rgym_exp/config" \
-            --config-name "rg-swarm.yaml"
+            --config-name "rg-swarm.yaml" \
+            2>&1 | tee "$current_log" &
         
+        local swarm_pid=$!
+        log_info "Started swarm process with PID: $swarm_pid"
+        
+        # Start monitoring in background
+        monitor_swarm_process $swarm_pid "$current_log" &
+        local monitor_pid=$!
+        
+        # Wait for either process to finish
+        wait $swarm_pid
         local exit_code=$?
+        
+        # Kill monitor process
+        kill $monitor_pid 2>/dev/null || true
+        wait $monitor_pid 2>/dev/null || true
+        
+        local end_time=$(date +%s)
+        local runtime=$((end_time - start_time))
         
         if [[ $exit_code -eq 0 ]]; then
             log_info "Swarm launcher completed successfully"
             break
         else
-            log_warn "Swarm launcher exited with code: $exit_code"
-            log_info "Restarting in 10 seconds... (Press Ctrl+C to stop)"
-            sleep 10
+            log_error "Swarm launcher failed (code: $exit_code, runtime: ${runtime}s)"
+            
+            # Show last few lines of error log
+            if [[ -f "$current_log" ]]; then
+                log_error "Last 10 lines of log:"
+                tail -n 10 "$current_log" | while IFS= read -r line; do
+                    log_error "  $line"
+                done
+            fi
+            
+            # Kill any remaining processes
+            kill_existing_swarm
+            
+            restart_count=$((restart_count + 1))
+            total_restarts=$((total_restarts + 1))
+            
+            # Check for quick restarts
+            if [[ $runtime -lt $quick_restart_threshold ]]; then
+                if [[ $restart_count -ge $max_quick_restarts ]]; then
+                    log_error "Too many quick failures ($restart_count). Waiting 2 minutes..."
+                    sleep 120
+                    restart_count=0
+                fi
+            else
+                restart_count=0  # Reset for successful longer runs
+            fi
+            
+            # Safety check - prevent infinite restarts
+            if [[ $total_restarts -gt 50 ]]; then
+                log_error "Reached maximum restart limit (50). Exiting."
+                exit 1
+            fi
         fi
     done
     
-    log_info "Training session completed"
+    log_info "Training session completed after $total_restarts restarts"
 }
 
 # Execute main function
