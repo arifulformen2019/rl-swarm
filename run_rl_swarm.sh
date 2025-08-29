@@ -432,7 +432,7 @@ install_python_deps() {
         log_info "Installing $package..."
         pip install "$package"
     done
-    pip install bitsandbytes
+    pip install bitsandbytes accelerate
     pip install colorama
     log_info "Python dependencies installed successfully"
 }
