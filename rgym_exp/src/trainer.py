@@ -1,6 +1,7 @@
 from typing import Any, Optional, List
 
 import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from genrl.data import DataManager
 from genrl.logging_utils.global_defs import get_logger
 from genrl.logging_utils.ml_logger import LoggerMixin
@@ -25,7 +26,6 @@ Do not explain your reasoning at all, provide only the final answer in the answe
 """
 
 
-
 class GRPOTrainerModule(GRPOLanguageTrainerModule, LoggerMixin):
     """
     Trainer for the Group Relative Policy Optimization (GRPO) method.
@@ -40,9 +40,57 @@ class GRPOTrainerModule(GRPOLanguageTrainerModule, LoggerMixin):
             models: List containing the model to be trained.
             **kwargs: Additional arguments for configuration.
         """
+        # Patch: load the model with 4-bit quantization if not already provided
+        if not models:
+            model_id = kwargs.get("model_id", "Qwen2.5-3B-Instruct-bnb-4bit")
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_compute_dtype=torch.bfloat16
+            )
+            tokenizer = AutoTokenizer.from_pretrained(model_id)
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
+                
+            model = AutoModelForCausalLM.from_pretrained(
+                model_id,
+                quantization_config=bnb_config,
+                device_map="auto",
+                torch_dtype=torch.bfloat16
+            )
+            models = [model]
+            self.tokenizer = tokenizer
+        
         super().__init__(models, **kwargs)
         judge_base_url = kwargs.get("judge_base_url", None)
         self.judge_client = JudgeClient(judge_base_url) if judge_base_url else None
+
+    def _initialize_model(self, enable_gradient_checkpointing: bool = False):
+        """
+        Override to handle quantized models properly.
+        Quantized models cannot be cast to different dtypes.
+        """
+        # Check if model is quantized (bitsandbytes)
+        is_quantized = (
+            hasattr(self.model, 'is_quantized') and self.model.is_quantized
+        ) or (
+            hasattr(self.model, 'config') and 
+            hasattr(self.model.config, 'quantization_config') and 
+            self.model.config.quantization_config is not None
+        )
+        
+        if is_quantized:
+            # For quantized models, don't cast dtype - just ensure it's on the right device
+            get_logger().info("Model is quantized, skipping dtype casting")
+            # Model should already be on correct device due to device_map="auto"
+        else:
+            # For regular models, apply the normal dtype casting
+            self.model = self.model.to(device=self.device, dtype=self.dtype)
+        
+        # Enable gradient checkpointing if requested
+        if enable_gradient_checkpointing and hasattr(self.model, 'gradient_checkpointing_enable'):
+            self.model.gradient_checkpointing_enable()
 
     @torch.no_grad()
     def evaluate(
