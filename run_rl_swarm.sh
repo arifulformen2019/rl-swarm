@@ -583,50 +583,6 @@ kill_existing_swarm() {
     log_info "Process cleanup completed"
 }
 
-# Monitor process and logs for errors
-monitor_swarm_process() {
-    local swarm_pid=$1
-    local log_file="$2"
-    local error_patterns=(
-        "EOFError: Ran out of input"
-        "BlockingIOError.*Resource temporarily unavailable"
-        "hivemind.dht.dht._run.*ERROR"
-        "Process DHT.*Traceback"
-        "Connection refused"
-        "CUDA out of memory"
-        "RuntimeError.*NCCL"
-        "\[Errno 11\] Resource temporarily unavailable"
-        "Failed to start DHT"
-        "DHT.*died unexpectedly"
-    )
-    
-    log_info "Starting process monitor for PID: $swarm_pid"
-    
-    while kill -0 $swarm_pid 2>/dev/null; do
-        # Check for error patterns in recent logs
-        if [[ -f "$log_file" ]]; then
-            for pattern in "${error_patterns[@]}"; do
-                if tail -n 100 "$log_file" | grep -E "$pattern" >/dev/null 2>&1; then
-                    log_error "Detected error pattern: $pattern"
-                    log_warn "Killing swarm process due to error..."
-                    kill_existing_swarm
-                    return 1
-                fi
-            done
-        fi
-        
-        # Check system resources
-        local mem_usage=$(free | grep Mem | awk '{print int($3/$2 * 100)}' 2>/dev/null || echo "0")
-        if [[ $mem_usage -gt 90 ]]; then
-            log_warn "High memory usage detected: ${mem_usage}%"
-        fi
-        
-        sleep 5
-    done
-    
-    return 0
-}
-
 # Handle interruption signals
 handle_interrupt() {
     log_warn "Received interrupt signal (Ctrl+C)..."
@@ -698,21 +654,12 @@ main() {
     
     echo_green ">> Done!"
     
-    # Get user preferences
-    get_user_preferences
-    
     # Final setup
     echo_green ">> Good luck in the swarm!"
     echo_blue ">> And remember to star the repo on GitHub! --> https://github.com/gensyn-ai/rl-swarm"
     
     # Launch the swarm with enhanced monitoring
     log_info "Launching RL-Swarm with enhanced error monitoring..."
-    
-    local restart_count=0
-    local max_quick_restarts=5
-    local quick_restart_threshold=30
-    local total_restarts=0
-    
     while true; do
         log_info "Starting swarm launcher..."
         pkill -f "python.*rgym_exp.runner.swarm_launcher" 2>/tmp/swarm_launcher_pkill.log || true
