@@ -425,7 +425,6 @@ install_python_deps() {
     local packages=(
         "gensyn-genrl==${GENRL_TAG}"
         "reasoning-gym>=0.1.20"
-        "trl==0.19.1"
         "hivemind@git+https://github.com/gensyn-ai/hivemind@639c964a8019de63135a2594663b5bec8e5356dd"
     )
     
@@ -433,6 +432,7 @@ install_python_deps() {
         log_info "Installing $package..."
         pip install "$package"
     done
+    pip install bitsandbytes
     pip install colorama
     log_info "Python dependencies installed successfully"
 }
