@@ -640,9 +640,6 @@ cleanup() {
     cleanup_cloudflared
     cleanup_server
     
-    # Remove modal credentials if they exist
-    rm -r "$ROOT"/modal-login/temp-data/*.json 2> /dev/null || true
-    
     exit 0
 }
 
@@ -717,87 +714,23 @@ main() {
     local total_restarts=0
     
     while true; do
-        local start_time=$(date +%s)
-        
-        # Kill any existing processes before starting
-        if [[ $restart_count -gt 0 ]]; then
-            log_info "Cleaning up before restart #$restart_count..."
-            kill_existing_swarm
-            
-            # Add progressive delay for repeated failures
-            local delay=$((10 + restart_count * 5))
-            if [[ $delay -gt 60 ]]; then
-                delay=60
-            fi
-            log_info "Waiting $delay seconds before restart..."
-            sleep $delay
-        fi
-        
-        log_info "Starting swarm launcher (attempt #$((total_restarts + 1)))..."
-        
-        # Create log file for this run
-        local current_log="$LOG_DIR/swarm_run_$(date +%Y%m%d_%H%M%S).log"
-        
-        # Start the swarm launcher in background with logging
+        log_info "Starting swarm launcher..."
+        pkill -f "python.*rgym_exp.runner.swarm_launcher" 2>/tmp/swarm_launcher_pkill.log || true
+        sleep 1
+        # Run the swarm launcher
         python -m rgym_exp.runner.swarm_launcher \
             --config-path "$ROOT/rgym_exp/config" \
-            --config-name "rg-swarm.yaml" \
-            2>&1 | tee "$current_log" &
-        
-        local swarm_pid=$!
-        log_info "Started swarm process with PID: $swarm_pid"
-        
-        # Start monitoring in background
-        monitor_swarm_process $swarm_pid "$current_log" &
-        local monitor_pid=$!
-        
-        # Wait for either process to finish
-        wait $swarm_pid
+            --config-name "rg-swarm.yaml"
+
         local exit_code=$?
-        
-        # Kill monitor process
-        kill $monitor_pid 2>/dev/null || true
-        wait $monitor_pid 2>/dev/null || true
-        
-        local end_time=$(date +%s)
-        local runtime=$((end_time - start_time))
-        
+
         if [[ $exit_code -eq 0 ]]; then
             log_info "Swarm launcher completed successfully"
             break
         else
-            log_error "Swarm launcher failed (code: $exit_code, runtime: ${runtime}s)"
-            
-            # Show last few lines of error log
-            if [[ -f "$current_log" ]]; then
-                log_error "Last 10 lines of log:"
-                tail -n 10 "$current_log" | while IFS= read -r line; do
-                    log_error "  $line"
-                done
-            fi
-            
-            # Kill any remaining processes
-            kill_existing_swarm
-            
-            restart_count=$((restart_count + 1))
-            total_restarts=$((total_restarts + 1))
-            
-            # Check for quick restarts
-            if [[ $runtime -lt $quick_restart_threshold ]]; then
-                if [[ $restart_count -ge $max_quick_restarts ]]; then
-                    log_error "Too many quick failures ($restart_count). Waiting 2 minutes..."
-                    sleep 120
-                    restart_count=0
-                fi
-            else
-                restart_count=0  # Reset for successful longer runs
-            fi
-            
-            # Safety check - prevent infinite restarts
-            if [[ $total_restarts -gt 50 ]]; then
-                log_error "Reached maximum restart limit (50). Exiting."
-                exit 1
-            fi
+            log_warn "Swarm launcher exited with code: $exit_code"
+            log_info "Restarting in 10 seconds... (Press Ctrl+C to stop)"
+            sleep 10
         fi
     done
     
