@@ -1,3 +1,4 @@
+```yaml
 log_dir: ${oc.env:ROOT,.}/logs
 
 hydra:
@@ -40,11 +41,7 @@ communications:
     - '/ip4/38.101.215.12/tcp/30011/p2p/QmQ2gEXoPJg6iMBSUFWGzAabS2VhnzuS782Y637hGjfsRJ'
     - '/ip4/38.101.215.13/tcp/30012/p2p/QmWhiaLrx3HRZfgXc2i7KW5nMUNK7P9tRc71yFJdGEZKkC'
     - '/ip4/38.101.215.14/tcp/30013/p2p/QmQa1SCfYTxx7RvU7qJJRo79Zm1RAwPpkeLueDVJuBBmFp'
-  memory_limits:
-    max_memory_mb: 8384  # 2GB max memory per worker
-    max_object_size: 167772160  # 50MB max object size
-    max_buffer_size: 335544320  # 100MB buffer size
-    max_cache_bytes: 671088640
+
 game_manager:
   _target_: rgym_exp.src.manager.SwarmGameManager
   max_stage: ${training.max_stage}
@@ -113,9 +110,6 @@ game_manager:
     disable_caching: true
     cache_locally: false
     cache_on_store: false
-    max_memory_mb: ${communications.memory_limits.max_memory_mb}
-    max_object_size: ${communications.memory_limits.max_object_size}
-    max_buffer_size: ${communications.memory_limits.max_buffer_size}
   coordinator:
     _target_: rgym_exp.src.coordinator.ModalSwarmCoordinator
     web3_url: ${blockchain.alchemy_url}
@@ -131,3 +125,4 @@ default_large_model_pool:
 default_small_model_pool:
   - Gensyn/Qwen2.5-0.5B-Instruct
   - Qwen/Qwen3-0.6B
+```
