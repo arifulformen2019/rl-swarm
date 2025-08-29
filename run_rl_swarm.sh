@@ -1,56 +1,91 @@
-#!/usr/bin/env bash
+#!/bin/bash
 
-set -euo pipefail
+# Removed set -euo pipefail for better error handling and process management
 
-# General arguments
-ROOT=$PWD
+# =============================================================================
+# RL-Swarm Launcher Script - Enhanced Version with Error Monitoring
+# =============================================================================
 
-# GenRL Swarm version to use
-GENRL_TAG="0.1.6"
+# Configuration
+readonly ROOT="$PWD"
+readonly GENRL_TAG="0.1.6"
+readonly LOG_DIR="$ROOT/logs"
+readonly CONFIG_DIR="$ROOT/configs"
 
+# Environment variables with defaults
 export IDENTITY_PATH
 export GENSYN_RESET_CONFIG
 export CONNECT_TO_TESTNET=true
 export ORG_ID
-export HF_HUB_DOWNLOAD_TIMEOUT=120  # 2 minutes
+export HF_HUB_DOWNLOAD_TIMEOUT=120
 export SWARM_CONTRACT="0xFaD7C5e93f28257429569B854151A1B8DCD404c2"
 export PRG_CONTRACT="0x51D4db531ae706a6eC732458825465058fA23a35"
 export HUGGINGFACE_ACCESS_TOKEN="None"
+export PORT=${PORT:-3000}
 export PRG_GAME=true
 
-# Path to an RSA private key. If this path does not exist, a new key pair will be created.
-# Remove this file if you want a new PeerID.
-DEFAULT_IDENTITY_PATH="$ROOT"/swarm.pem
+# Path configurations
+readonly DEFAULT_IDENTITY_PATH="$ROOT/swarm.pem"
 IDENTITY_PATH=${IDENTITY_PATH:-$DEFAULT_IDENTITY_PATH}
-
 DOCKER=${DOCKER:-""}
 GENSYN_RESET_CONFIG=${GENSYN_RESET_CONFIG:-""}
-
-# Bit of a workaround for the non-root docker container.
-if [ -n "$DOCKER" ]; then
-    volumes=(
-        /home/gensyn/rl_swarm/modal-login/temp-data
-        /home/gensyn/rl_swarm/keys
-        /home/gensyn/rl_swarm/configs
-        /home/gensyn/rl_swarm/logs
-    )
-
-    for volume in ${volumes[@]}; do
-        sudo chown -R 1001:1001 $volume
-    done
-fi
-
-# Will ignore any visible GPUs if set.
 CPU_ONLY=${CPU_ONLY:-""}
-
-# Set if successfully parsed from modal-login/temp-data/userData.json.
 ORG_ID=${ORG_ID:-""}
 
-GREEN_TEXT="\033[32m"
-BLUE_TEXT="\033[34m"
-RED_TEXT="\033[31m"
-RESET_TEXT="\033[0m"
+# Cloudflared and server variables
+TUNNEL_PID=""
+TUNNEL_TYPE=""
+FORWARDING_URL=""
+SERVER_PID=""
 
+# Architecture detection for cloudflared
+CF_ARCH=$(uname -m)
+case "$CF_ARCH" in
+    x86_64) CF_ARCH="amd64" ;;
+    aarch64) CF_ARCH="arm64" ;;
+    armv7l) CF_ARCH="arm" ;;
+    *) CF_ARCH="amd64" ;;
+esac
+
+# Color codes
+readonly GREEN_TEXT="\033[32m"
+readonly BLUE_TEXT="\033[34m"
+readonly RED_TEXT="\033[31m"
+readonly YELLOW_TEXT="\033[33m"
+readonly CYAN_TEXT="\033[36m"
+readonly BOLD_TEXT="\033[1m"
+readonly RESET_TEXT="\033[0m"
+
+# Aliases for compatibility
+readonly GREEN="${GREEN_TEXT}${BOLD_TEXT}"
+readonly RED="${RED_TEXT}${BOLD_TEXT}"
+readonly YELLOW="${YELLOW_TEXT}${BOLD_TEXT}"
+readonly CYAN="${CYAN_TEXT}${BOLD_TEXT}"
+readonly BOLD="${BOLD_TEXT}"
+readonly NC="${RESET_TEXT}"
+
+# =============================================================================
+# Utility Functions
+# =============================================================================
+
+# Logging functions
+log_info() {
+    echo -e "${GREEN_TEXT}[INFO]${RESET_TEXT} $1"
+}
+
+log_warn() {
+    echo -e "${YELLOW_TEXT}[WARN]${RESET_TEXT} $1"
+}
+
+log_error() {
+    echo -e "${RED_TEXT}[ERROR]${RESET_TEXT} $1"
+}
+
+log_debug() {
+    echo -e "${BLUE_TEXT}[DEBUG]${RESET_TEXT} $1"
+}
+
+# Legacy echo functions for compatibility
 echo_green() {
     echo -e "$GREEN_TEXT$1$RESET_TEXT"
 }
@@ -63,18 +98,550 @@ echo_red() {
     echo -e "$RED_TEXT$1$RESET_TEXT"
 }
 
-ROOT_DIR="$(cd $(dirname ${BASH_SOURCE[0]}) && pwd)"
+# Initialize directories
+init_directories() {
+    log_info "Initializing directories..."
+    
+    local directories=("$LOG_DIR" "$CONFIG_DIR")
+    
+    for dir in "${directories[@]}"; do
+        if [[ ! -d "$dir" ]]; then
+            mkdir -p "$dir"
+            log_info "Created directory: $dir"
+        fi
+    done
+}
 
-# Function to clean up the server process upon exit
+# Docker volume setup
+setup_docker_volumes() {
+    if [[ -n "$DOCKER" ]]; then
+        log_info "Setting up Docker volumes..."
+        
+        local volumes=(
+            "/home/gensyn/rl_swarm/modal-login/temp-data"
+            "/home/gensyn/rl_swarm/keys"
+            "/home/gensyn/rl_swarm/configs"
+            "/home/gensyn/rl_swarm/logs"
+        )
+        
+        for volume in "${volumes[@]}"; do
+            if [[ -d "$volume" ]]; then
+                sudo chown -R 1001:1001 "$volume"
+                log_info "Set ownership for volume: $volume"
+            fi
+        done
+    fi
+}
+
+# Enhanced system limits setup
+setup_system_limits() {
+    log_info "Setting up system limits to prevent resource errors..."
+    
+    # Increase file descriptor limits
+    ulimit -n 65536 2>/dev/null || {
+        log_warn "Failed to increase file descriptor limit"
+    }
+    
+    # Increase process limits
+    ulimit -u 32768 2>/dev/null || {
+        log_warn "Failed to increase process limit"
+    }
+    
+    # Set memory overcommit to prevent allocation failures
+    echo 1 | sudo tee /proc/sys/vm/overcommit_memory >/dev/null 2>&1 || {
+        log_debug "Could not set memory overcommit (may need sudo)"
+    }
+    
+    log_info "System limits configured"
+}
+
+# =============================================================================
+# Cloudflared Installation and Management
+# =============================================================================
+
+install_cloudflared() {
+    if command -v cloudflared >/dev/null 2>&1; then
+        echo -e "${GREEN}[✓] Cloudflared is already installed.${NC}"
+        return 0
+    fi
+    
+    echo -e "\n${YELLOW}[✓] Installing cloudflared...${NC}"
+    
+    local cf_url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$CF_ARCH"
+    
+    if ! wget -q --show-progress "$cf_url" -O cloudflared 2>"$LOG_DIR/cloudflared_download.log"; then
+        echo -e "${RED}[✗] Failed to download cloudflared.${NC}"
+        [[ -f "$LOG_DIR/cloudflared_download.log" ]] && cat "$LOG_DIR/cloudflared_download.log"
+        return 1
+    fi
+    
+    chmod +x cloudflared
+    
+    if ! sudo mv cloudflared /usr/local/bin/; then
+        echo -e "${RED}[✗] Failed to move cloudflared to /usr/local/bin/.${NC}"
+        return 1
+    fi
+    
+    echo -e "${GREEN}[✓] Cloudflared installed successfully.${NC}"
+    return 0
+}
+
+try_cloudflared() {
+    echo -e "\n${CYAN}[✓] Trying cloudflared...${NC}"
+    
+    # Check and install cloudflared
+    if ! install_cloudflared; then
+        echo -e "${RED}[✗] Failed to install cloudflared. Check $LOG_DIR/cloudflared_download.log for details.${NC}"
+        [[ -f "$LOG_DIR/cloudflared_download.log" ]] && cat "$LOG_DIR/cloudflared_download.log"
+        return 1
+    fi
+    
+    # Check PORT variable
+    if [[ -z "$PORT" ]]; then
+        echo -e "${YELLOW}[!] PORT variable is not set. Defaulting to 3000.${NC}"
+        PORT=3000
+    fi
+    
+    # Start cloudflared tunnel
+    echo -e "${CYAN}[✓] Starting cloudflared tunnel on http://localhost:$PORT...${NC}"
+    TUNNEL_TYPE="cloudflared"
+    
+    local cloudflared_log="$LOG_DIR/cloudflared_output.log"
+    cloudflared tunnel --url "http://localhost:$PORT" 2>&1 | tee "$cloudflared_log" &
+    TUNNEL_PID=$!
+    
+    # Wait for URL to appear, max 30 seconds
+    local counter=0
+    local max_wait=30
+    echo -e "${CYAN}[✓] Waiting for cloudflared URL (up to $max_wait seconds)...${NC}"
+    
+    while [[ $counter -lt $max_wait ]]; do
+        if [[ -f "$cloudflared_log" ]]; then
+            CLOUDFLARED_URL=$(grep -o 'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' "$cloudflared_log" | head -n1)
+            if [[ -n "$CLOUDFLARED_URL" ]]; then
+                echo -e "${GREEN}[✓] Cloudflared tunnel started: $CLOUDFLARED_URL${NC}"
+                FORWARDING_URL="$CLOUDFLARED_URL"
+                return 0
+            fi
+        fi
+        sleep 1
+        counter=$((counter + 1))
+    done
+    
+    # If URL couldn't be retrieved
+    echo -e "${RED}[✗] Failed to retrieve cloudflared URL after $max_wait seconds.${NC}"
+    echo -e "${RED}[✗] Check $cloudflared_log for details:${NC}"
+    [[ -f "$cloudflared_log" ]] && cat "$cloudflared_log"
+    kill $TUNNEL_PID 2>/dev/null || true
+    return 1
+}
+
+# Cleanup cloudflared tunnel
+cleanup_cloudflared() {
+    if [[ -n "$TUNNEL_PID" ]]; then
+        log_info "Stopping cloudflared tunnel (PID: $TUNNEL_PID)..."
+        kill $TUNNEL_PID 2>/dev/null || true
+        wait $TUNNEL_PID 2>/dev/null || true
+        TUNNEL_PID=""
+    fi
+}
+
+# Cleanup server process
+cleanup_server() {
+    if [[ -n "$SERVER_PID" ]]; then
+        log_info "Stopping modal login server (PID: $SERVER_PID)..."
+        kill $SERVER_PID 2>/dev/null || true
+        wait $SERVER_PID 2>/dev/null || true
+        SERVER_PID=""
+    fi
+}
+
+# =============================================================================
+# Node.js and Yarn Installation
+# =============================================================================
+
+install_nodejs() {
+    if ! command -v node > /dev/null 2>&1; then
+        log_info "Node.js not found. Installing NVM and latest Node.js..."
+        
+        export NVM_DIR="$HOME/.nvm"
+        if [[ ! -d "$NVM_DIR" ]]; then
+            curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash
+        fi
+        
+        # Source NVM
+        [[ -s "$NVM_DIR/nvm.sh" ]] && \. "$NVM_DIR/nvm.sh"
+        [[ -s "$NVM_DIR/bash_completion" ]] && \. "$NVM_DIR/bash_completion"
+        
+        nvm install node
+        log_info "Node.js installed successfully"
+    else
+        log_info "Node.js is already installed: $(node -v)"
+    fi
+}
+
+install_yarn() {
+    if ! command -v yarn > /dev/null 2>&1; then
+        log_info "Installing Yarn..."
+        
+        # Detect OS and install accordingly
+        if grep -qi "ubuntu" /etc/os-release 2> /dev/null || uname -r | grep -qi "microsoft"; then
+            log_info "Detected Ubuntu/WSL. Installing Yarn via apt..."
+            curl -sS https://dl.yarnpkg.com/debian/pubkey.gpg | sudo apt-key add -
+            echo "deb https://dl.yarnpkg.com/debian/ stable main" | sudo tee /etc/apt/sources.list.d/yarn.list
+            sudo apt update && sudo apt install -y yarn
+        else
+            log_info "Installing Yarn globally with npm..."
+            npm install -g --silent yarn
+        fi
+        
+        log_info "Yarn installed successfully"
+    else
+        log_info "Yarn is already installed: $(yarn --version)"
+    fi
+}
+
+# =============================================================================
+# Modal Login Server Setup
+# =============================================================================
+
+setup_modal_login() {
+    log_info "Setting up modal login server..."
+    
+    cd modal-login || {
+        log_error "Failed to change to modal-login directory"
+        return 1
+    }
+    
+    # Update environment file
+    local env_file="$ROOT/modal-login/.env"
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        sed -i '' "3s/.*/SWARM_CONTRACT_ADDRESS=$SWARM_CONTRACT/" "$env_file"
+        sed -i '' "4s/.*/PRG_CONTRACT_ADDRESS=$PRG_CONTRACT/" "$env_file"
+    else
+        sed -i "3s/.*/SWARM_CONTRACT_ADDRESS=$SWARM_CONTRACT/" "$env_file"
+        sed -i "4s/.*/PRG_CONTRACT_ADDRESS=$PRG_CONTRACT/" "$env_file"
+    fi
+    
+    # Install dependencies and build (skip if Docker)
+    if [[ -z "$DOCKER" ]]; then
+        log_info "Installing dependencies and building server..."
+        yarn install --immutable
+        yarn build > "$LOG_DIR/yarn.log" 2>&1
+    fi
+    
+    # Start server
+    log_info "Starting modal login server..."
+    yarn start >> "$LOG_DIR/yarn.log" 2>&1 &
+    
+    SERVER_PID=$!
+    log_info "Started server process: $SERVER_PID"
+    sleep 5
+    
+    # Check if userData.json already exists
+    local user_data_file="$ROOT/modal-login/temp-data/userData.json"
+    
+    if [[ ! -f "$user_data_file" ]]; then
+        log_info "userData.json not found. Setting up cloudflared tunnel..."
+        
+        # Try to setup cloudflared tunnel only if userData.json doesn't exist
+        if try_cloudflared; then
+            log_info "Cloudflared tunnel is available at: $FORWARDING_URL"
+        else
+            log_warn "Cloudflared tunnel setup failed, falling back to localhost"
+        fi
+        
+        # Open browser
+        if [[ -z "$DOCKER" ]]; then
+            local url_to_open="http://localhost:3000"
+            if [[ -n "$FORWARDING_URL" ]]; then
+                url_to_open="$FORWARDING_URL"
+            fi
+            
+            if open "$url_to_open" 2> /dev/null; then
+                log_info "Successfully opened $url_to_open in your default browser"
+            else
+                log_warn "Failed to open $url_to_open. Please open it manually"
+            fi
+        else
+            log_info "Please open http://localhost:3000 in your host browser"
+            if [[ -n "$FORWARDING_URL" ]]; then
+                log_info "Or use the cloudflared tunnel: $FORWARDING_URL"
+            fi
+        fi
+    else
+        log_info "userData.json already exists. Skipping cloudflared setup."
+    fi
+    
+    cd ..
+}
+
+# Wait for user data
+wait_for_user_data() {
+    log_info "Waiting for modal userData.json to be created..."
+    
+    local user_data_file="modal-login/temp-data/userData.json"
+    while [[ ! -f "$user_data_file" ]]; do
+        sleep 5
+    done
+    
+    log_info "Found userData.json. Proceeding..."
+    
+    # Extract ORG_ID
+    ORG_ID=$(awk 'BEGIN { FS = "\"" } !/^[ \t]*[{}]/ { print $(NF - 1); exit }' "$user_data_file")
+    log_info "Your ORG_ID is set to: $ORG_ID"
+    export ORG_ID
+}
+
+# Wait for API key activation
+wait_for_api_activation() {
+    log_info "Waiting for API key to become activated..."
+    
+    while true; do
+        local status
+        status=$(curl -s "http://localhost:3000/api/get-api-key-status?orgId=$ORG_ID" 2>/dev/null || echo "error")
+        
+        if [[ "$status" == "activated" ]]; then
+            log_info "API key is activated! Proceeding..."
+            break
+        else
+            log_info "Waiting for API key to be activated..."
+            sleep 5
+        fi
+    done
+}
+
+# =============================================================================
+# Python Dependencies Installation
+# =============================================================================
+
+install_python_deps() {
+    log_info "Installing Python dependencies..."
+    
+    # Upgrade pip
+    pip install --upgrade pip
+    
+    # Install required packages
+    local packages=(
+        "gensyn-genrl==${GENRL_TAG}"
+        "reasoning-gym>=0.1.20"
+        "hivemind@git+https://github.com/gensyn-ai/hivemind@639c964a8019de63135a2594663b5bec8e5356dd"
+    )
+    
+    for package in "${packages[@]}"; do
+        log_info "Installing $package..."
+        pip install "$package"
+    done
+    pip install colorama
+    log_info "Python dependencies installed successfully"
+}
+
+# Patch hivemind p2p daemon timeout
+patch_hivemind_timeout() {
+    log_info "Checking for hivemind p2p daemon patch..."
+    
+    # Common paths where the file might be located
+    local possible_paths=(
+        "$ROOT/.venv/lib/python3.12/site-packages/hivemind/p2p/p2p_daemon.py"
+        "$HOME/rl-swarm/.venv/lib/python3.12/site-packages/hivemind/p2p/p2p_daemon.py"
+        "$(python -c 'import hivemind; print(hivemind.__file__.replace("__init__.py", "p2p/p2p_daemon.py"))' 2>/dev/null || echo '')"
+    )
+    
+    # Try to find the file
+    local daemon_file=""
+    for path in "${possible_paths[@]}"; do
+        if [[ -f "$path" ]]; then
+            daemon_file="$path"
+            break
+        fi
+    done
+    
+    if [[ -n "$daemon_file" ]]; then
+        log_info "Found hivemind p2p daemon file: $daemon_file"
+        
+        # Check if patch is already applied
+        if grep -q "startup_timeout: float = 120" "$daemon_file"; then
+            log_info "Timeout patch already applied"
+        else
+            log_info "Applying timeout patch (15s -> 120s)..."
+            # Create backup first
+            cp "$daemon_file" "$daemon_file.backup"
+            
+            # Apply patch
+            sed -i 's/startup_timeout: float = 15/startup_timeout: float = 120/' "$daemon_file"
+            
+            # Verify patch was applied
+            if grep -q "startup_timeout: float = 120" "$daemon_file"; then
+                log_info "Timeout patch applied successfully"
+            else
+                log_warn "Failed to apply timeout patch"
+                # Restore backup if patch failed
+                mv "$daemon_file.backup" "$daemon_file"
+            fi
+        fi
+    else
+        log_warn "Hivemind p2p daemon file not found. Patch will be skipped."
+        log_debug "Searched paths: ${possible_paths[*]}"
+    fi
+}
+
+# =============================================================================
+# Configuration Management
+# =============================================================================
+
+setup_config() {
+    log_info "Setting up configuration..."
+    
+    local config_file="$CONFIG_DIR/rg-swarm.yaml"
+    local default_config="$ROOT/rgym_exp/config/rg-swarm.yaml"
+    
+    if [[ -f "$config_file" ]]; then
+        if ! cmp -s "$default_config" "$config_file"; then
+            if [[ -z "$GENSYN_RESET_CONFIG" ]]; then
+                log_warn "Found differences in rg-swarm.yaml. Set GENSYN_RESET_CONFIG to reset to default."
+            else
+                log_info "Backing up existing config and resetting to default..."
+                mv "$config_file" "$config_file.bak"
+                cp "$default_config" "$config_file"
+            fi
+        fi
+    else
+        log_info "Copying default configuration..."
+        cp "$default_config" "$config_file"
+    fi
+    
+    # Set permissions for Docker
+    if [[ -n "$DOCKER" ]]; then
+        sudo chmod -R 0777 "$CONFIG_DIR"
+    fi
+}
+
+# =============================================================================
+# User Configuration
+# =============================================================================
+
+get_user_preferences() {
+    echo -en $GREEN_TEXT
+    read -p ">> Would you like to push models you train in the RL swarm to the Hugging Face Hub? [y/N] " yn
+    echo -en $RESET_TEXT
+    yn=${yn:-N} # Default to "N" if the user presses Enter
+    case $yn in
+        [Yy]*) read -p "Enter your Hugging Face access token: " HUGGINGFACE_ACCESS_TOKEN ;;
+        [Nn]*) HUGGINGFACE_ACCESS_TOKEN="None" ;;
+        *) echo ">>> No answer was given, so NO models will be pushed to Hugging Face Hub" && HUGGINGFACE_ACCESS_TOKEN="None" ;;
+    esac
+
+    echo -en $GREEN_TEXT
+    read -p ">> Enter the name of the model you want to use in huggingface repo/name format, or press [Enter] to use the default model. " MODEL_NAME
+    echo -en $RESET_TEXT
+
+    # Only export MODEL_NAME if user provided a non-empty value
+    if [ -n "$MODEL_NAME" ]; then
+        export MODEL_NAME
+        echo_green ">> Using model: $MODEL_NAME"
+    else
+        echo_green ">> Using default model from config"
+    fi
+
+    echo -en $GREEN_TEXT
+    read -p ">> Would you like your model to participate in the AI Prediction Market? [Y/n] " yn
+    if [ "$yn" = "n" ] || [ "$yn" = "N" ]; then
+        PRG_GAME=false
+        echo_green ">> Playing PRG game: false"
+    else
+        echo_green ">> Playing PRG game: true"
+    fi
+    echo -en $RESET_TEXT
+}
+
+# =============================================================================
+# Enhanced Error Handling and Process Management
+# =============================================================================
+
+# Kill existing swarm processes with better detection
+kill_existing_swarm() {
+    log_warn "Killing existing swarm launcher processes..."
+    
+    # Kill by process name pattern
+    pkill -9 -f rgym_exp.runner.swarm_launcher 2>/dev/null || true
+    
+    # Kill related Python processes that might be stuck
+    pkill -9 -f "hivemind.*dht" 2>/dev/null || true
+    pkill -9 -f "python.*swarm" 2>/dev/null || true
+    
+    # Wait and verify
+    sleep 3
+    
+    # Double check and force kill if needed
+    local remaining_pids=$(pgrep -f rgym_exp.runner.swarm_launcher 2>/dev/null || true)
+    if [[ -n "$remaining_pids" ]]; then
+        log_warn "Force killing remaining processes: $remaining_pids"
+        echo "$remaining_pids" | xargs -r kill -9 2>/dev/null || true
+    fi
+    
+    log_info "Process cleanup completed"
+}
+
+# Monitor process and logs for errors
+monitor_swarm_process() {
+    local swarm_pid=$1
+    local log_file="$2"
+    local error_patterns=(
+        "EOFError: Ran out of input"
+        "BlockingIOError.*Resource temporarily unavailable"
+        "hivemind.dht.dht._run.*ERROR"
+        "Process DHT.*Traceback"
+        "Connection refused"
+        "CUDA out of memory"
+        "RuntimeError.*NCCL"
+        "\[Errno 11\] Resource temporarily unavailable"
+        "Failed to start DHT"
+        "DHT.*died unexpectedly"
+    )
+    
+    log_info "Starting process monitor for PID: $swarm_pid"
+    
+    while kill -0 $swarm_pid 2>/dev/null; do
+        # Check for error patterns in recent logs
+        if [[ -f "$log_file" ]]; then
+            for pattern in "${error_patterns[@]}"; do
+                if tail -n 100 "$log_file" | grep -E "$pattern" >/dev/null 2>&1; then
+                    log_error "Detected error pattern: $pattern"
+                    log_warn "Killing swarm process due to error..."
+                    kill_existing_swarm
+                    return 1
+                fi
+            done
+        fi
+        
+        # Check system resources
+        local mem_usage=$(free | grep Mem | awk '{print int($3/$2 * 100)}' 2>/dev/null || echo "0")
+        if [[ $mem_usage -gt 90 ]]; then
+            log_warn "High memory usage detected: ${mem_usage}%"
+        fi
+        
+        sleep 5
+    done
+    
+    return 0
+}
+
+# Handle interruption signals
+handle_interrupt() {
+    log_warn "Received interrupt signal (Ctrl+C)..."
+    kill_existing_swarm
+    cleanup
+}
+
 cleanup() {
-    echo_green ">> Shutting down trainer..."
-
+    log_info "Shutting down trainer..."
+    kill_existing_swarm
+    cleanup_cloudflared
+    cleanup_server
+    
     # Remove modal credentials if they exist
-    rm -r $ROOT_DIR/modal-login/temp-data/*.json 2> /dev/null || true
-
-    # Kill all processes belonging to this script's process group
-    kill -- -$$ || true
-
+    rm -r "$ROOT"/modal-login/temp-data/*.json 2> /dev/null || true
+    
     exit 0
 }
 
@@ -82,193 +649,149 @@ errnotify() {
     echo_red ">> An error was detected while running rl-swarm. See $ROOT/logs for full logs."
 }
 
-trap cleanup EXIT
-trap errnotify ERR
+# =============================================================================
+# Main Execution
+# =============================================================================
 
-echo -e "\033[38;5;224m"
-cat << "EOF"
+display_banner() {
+    echo -e "\033[38;5;224m"
+    cat << "EOF"
     ██████  ██            ███████ ██     ██  █████  ██████  ███    ███
     ██   ██ ██            ██      ██     ██ ██   ██ ██   ██ ████  ████
     ██████  ██      █████ ███████ ██  █  ██ ███████ ██████  ██ ████ ██
     ██   ██ ██                 ██ ██ ███ ██ ██   ██ ██   ██ ██  ██  ██
     ██   ██ ███████       ███████  ███ ███  ██   ██ ██   ██ ██      ██
 
-    From Gensyn
+    From Gensyn - Enhanced Version with Error Monitoring
 
 EOF
+    echo -e "$RESET_TEXT"
+}
 
-# Create logs directory if it doesn't exist
-mkdir -p "$ROOT/logs"
-
-if [ "$CONNECT_TO_TESTNET" = true ]; then
-    # Run modal_login server.
-    echo "Please login to create an Ethereum Server Wallet"
-    cd modal-login
-    # Check if the yarn command exists; if not, install Yarn.
-
-    # Node.js + NVM setup
-    if ! command -v node > /dev/null 2>&1; then
-        echo "Node.js not found. Installing NVM and latest Node.js..."
-        export NVM_DIR="$HOME/.nvm"
-        if [ ! -d "$NVM_DIR" ]; then
-            curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash
-        fi
-        [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
-        [ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"
-        nvm install node
-    else
-        echo "Node.js is already installed: $(node -v)"
+main() {
+    # Set up trap for cleanup and interrupt handling
+    trap handle_interrupt SIGINT SIGTERM
+    trap cleanup EXIT
+    trap errnotify ERR
+    
+    # Initialize
+    display_banner
+    init_directories
+    setup_docker_volumes
+    setup_system_limits
+    
+    # Testnet connection setup
+    if [[ "$CONNECT_TO_TESTNET" == "true" ]]; then
+        log_info "Setting up testnet connection..."
+        echo "Please login to create an Ethereum Server Wallet"
+        
+        install_nodejs
+        install_yarn
+        setup_modal_login
+        wait_for_user_data
+        wait_for_api_activation
     fi
-
-    if ! command -v yarn > /dev/null 2>&1; then
-        # Detect Ubuntu (including WSL Ubuntu) and install Yarn accordingly
-        if grep -qi "ubuntu" /etc/os-release 2> /dev/null || uname -r | grep -qi "microsoft"; then
-            echo "Detected Ubuntu or WSL Ubuntu. Installing Yarn via apt..."
-            curl -sS https://dl.yarnpkg.com/debian/pubkey.gpg | sudo apt-key add -
-            echo "deb https://dl.yarnpkg.com/debian/ stable main" | sudo tee /etc/apt/sources.list.d/yarn.list
-            sudo apt update && sudo apt install -y yarn
-        else
-            echo "Yarn not found. Installing Yarn globally with npm (no profile edits)…"
-            # This lands in $NVM_DIR/versions/node/<ver>/bin which is already on PATH
-            npm install -g --silent yarn
-        fi
-    fi
-
-    ENV_FILE="$ROOT"/modal-login/.env
-    if [[ "$OSTYPE" == "darwin"* ]]; then
-        # macOS version
-        sed -i '' "3s/.*/SWARM_CONTRACT_ADDRESS=$SWARM_CONTRACT/" "$ENV_FILE"
-        sed -i '' "4s/.*/PRG_CONTRACT_ADDRESS=$PRG_CONTRACT/" "$ENV_FILE"
-
-    else
-        # Linux version
-        sed -i "3s/.*/SWARM_CONTRACT_ADDRESS=$SWARM_CONTRACT/" "$ENV_FILE"
-        sed -i "4s/.*/PRG_CONTRACT_ADDRESS=$PRG_CONTRACT/" "$ENV_FILE"
-    fi
-
-
-    # Docker image already builds it, no need to again.
-    if [ -z "$DOCKER" ]; then
-        yarn install --immutable
-        echo "Building server"
-        yarn build > "$ROOT/logs/yarn.log" 2>&1
-    fi
-    yarn start >> "$ROOT/logs/yarn.log" 2>&1 & # Run in background and log output
-
-    SERVER_PID=$!  # Store the process ID
-    echo "Started server process: $SERVER_PID"
-    sleep 5
-
-    # Try to open the URL in the default browser
-    if [ -z "$DOCKER" ]; then
-        if open http://localhost:3000 2> /dev/null; then
-            echo_green ">> Successfully opened http://localhost:3000 in your default browser."
-        else
-            echo ">> Failed to open http://localhost:3000. Please open it manually."
-        fi
-    else
-        echo_green ">> Please open http://localhost:3000 in your host browser."
-    fi
-
-    cd ..
-
-    echo_green ">> Waiting for modal userData.json to be created..."
-    while [ ! -f "modal-login/temp-data/userData.json" ]; do
-        sleep 5  # Wait for 5 seconds before checking again
-    done
-    echo "Found userData.json. Proceeding..."
-
-    ORG_ID=$(awk 'BEGIN { FS = "\"" } !/^[ \t]*[{}]/ { print $(NF - 1); exit }' modal-login/temp-data/userData.json)
-    echo "Your ORG_ID is set to: $ORG_ID"
-
-    # Wait until the API key is activated by the client
-    echo "Waiting for API key to become activated..."
+    
+    # Install dependencies
+    echo_green ">> Getting requirements..."
+    install_python_deps
+    patch_hivemind_timeout
+    setup_config
+    
+    echo_green ">> Done!"
+    
+    # Get user preferences
+    get_user_preferences
+    
+    # Final setup
+    echo_green ">> Good luck in the swarm!"
+    echo_blue ">> And remember to star the repo on GitHub! --> https://github.com/gensyn-ai/rl-swarm"
+    
+    # Launch the swarm with enhanced monitoring
+    log_info "Launching RL-Swarm with enhanced error monitoring..."
+    
+    local restart_count=0
+    local max_quick_restarts=5
+    local quick_restart_threshold=30
+    local total_restarts=0
+    
     while true; do
-        STATUS=$(curl -s "http://localhost:3000/api/get-api-key-status?orgId=$ORG_ID")
-        if [[ "$STATUS" == "activated" ]]; then
-            echo "API key is activated! Proceeding..."
+        local start_time=$(date +%s)
+        
+        # Kill any existing processes before starting
+        if [[ $restart_count -gt 0 ]]; then
+            log_info "Cleaning up before restart #$restart_count..."
+            kill_existing_swarm
+            
+            # Add progressive delay for repeated failures
+            local delay=$((10 + restart_count * 5))
+            if [[ $delay -gt 60 ]]; then
+                delay=60
+            fi
+            log_info "Waiting $delay seconds before restart..."
+            sleep $delay
+        fi
+        
+        log_info "Starting swarm launcher (attempt #$((total_restarts + 1)))..."
+        
+        # Create log file for this run
+        local current_log="$LOG_DIR/swarm_run_$(date +%Y%m%d_%H%M%S).log"
+        
+        # Start the swarm launcher in background with logging
+        python -m rgym_exp.runner.swarm_launcher \
+            --config-path "$ROOT/rgym_exp/config" \
+            --config-name "rg-swarm.yaml" \
+            2>&1 | tee "$current_log" &
+        
+        local swarm_pid=$!
+        log_info "Started swarm process with PID: $swarm_pid"
+        
+        # Start monitoring in background
+        monitor_swarm_process $swarm_pid "$current_log" &
+        local monitor_pid=$!
+        
+        # Wait for either process to finish
+        wait $swarm_pid
+        local exit_code=$?
+        
+        # Kill monitor process
+        kill $monitor_pid 2>/dev/null || true
+        wait $monitor_pid 2>/dev/null || true
+        
+        local end_time=$(date +%s)
+        local runtime=$((end_time - start_time))
+        
+        if [[ $exit_code -eq 0 ]]; then
+            log_info "Swarm launcher completed successfully"
             break
         else
-            echo "Waiting for API key to be activated..."
-            sleep 5
-        fi
-    done
-fi
-
-echo_green ">> Getting requirements..."
-pip install --upgrade pip
-
- echo_green ">> Installing GenRL..."
-pip install gensyn-genrl==${GENRL_TAG}
-pip install reasoning-gym>=0.1.20 # for reasoning gym env
-pip install hivemind@git+https://github.com/gensyn-ai/hivemind@639c964a8019de63135a2594663b5bec8e5356dd # We need the latest, 1.1.11 is broken
-
-
-if [ ! -d "$ROOT/configs" ]; then
-    mkdir "$ROOT/configs"
-fi  
-if [ -f "$ROOT/configs/rg-swarm.yaml" ]; then
-    # Use cmp -s for a silent comparison. If different, backup and copy.
-    if ! cmp -s "$ROOT/rgym_exp/config/rg-swarm.yaml" "$ROOT/configs/rg-swarm.yaml"; then
-        if [ -z "$GENSYN_RESET_CONFIG" ]; then
-            echo_green ">> Found differences in rg-swarm.yaml. If you would like to reset to the default, set GENSYN_RESET_CONFIG to a non-empty value."
-        else
-            echo_green ">> Found differences in rg-swarm.yaml. Backing up existing config."
-            mv "$ROOT/configs/rg-swarm.yaml" "$ROOT/configs/rg-swarm.yaml.bak"
-            cp "$ROOT/rgym_exp/config/rg-swarm.yaml" "$ROOT/configs/rg-swarm.yaml"
-        fi
-    fi
-else
-    # If the config doesn't exist, just copy it.
-    cp "$ROOT/rgym_exp/config/rg-swarm.yaml" "$ROOT/configs/rg-swarm.yaml"
-fi
-
-if [ -n "$DOCKER" ]; then
-    # Make it easier to edit the configs on Linux systems.
-    sudo chmod -R 0777 /home/gensyn/rl_swarm/configs
-fi
-
-echo_green ">> Done!"
-
-
-echo -en $GREEN_TEXT
-read -p ">> Would you like to push models you train in the RL swarm to the Hugging Face Hub? [y/N] " yn
-echo -en $RESET_TEXT
-yn=${yn:-N} # Default to "N" if the user presses Enter
-case $yn in
-    [Yy]*) read -p "Enter your Hugging Face access token: " HUGGINGFACE_ACCESS_TOKEN ;;
-    [Nn]*) HUGGINGFACE_ACCESS_TOKEN="None" ;;
-    *) echo ">>> No answer was given, so NO models will be pushed to Hugging Face Hub" && HUGGINGFACE_ACCESS_TOKEN="None" ;;
-esac
-
-
-echo -en $GREEN_TEXT
-read -p ">> Enter the name of the model you want to use in huggingface repo/name format, or press [Enter] to use the default model. " MODEL_NAME
-echo -en $RESET_TEXT
-
-# Only export MODEL_NAME if user provided a non-empty value
-if [ -n "$MODEL_NAME" ]; then
-    export MODEL_NAME
-    echo_green ">> Using model: $MODEL_NAME"
-else
-    echo_green ">> Using default model from config"
-fi
-
-echo -en $GREEN_TEXT
-read -p ">> Would you like your model to participate in the AI Prediction Market? [Y/n] " yn
-if [ "$yn" = "n" ] || [ "$yn" = "N" ]; then
-    PRG_GAME=false
-    echo_green ">> Playing PRG game: false"
-else
-    echo_green ">> Playing PRG game: true"
-fi
-
-echo -en $RESET_TEXT
-echo_green ">> Good luck in the swarm!"
-echo_blue ">> And remember to star the repo on GitHub! --> https://github.com/gensyn-ai/rl-swarm"
-
-python -m rgym_exp.runner.swarm_launcher \
-    --config-path "$ROOT/rgym_exp/config" \
-    --config-name "rg-swarm.yaml" 
-
-wait  # Keep script running until Ctrl+C
+            log_error "Swarm launcher failed (code: $exit_code, runtime: ${runtime}s)"
+            
+            # Show last few lines of error log
+            if [[ -f "$current_log" ]]; then
+                log_error "Last 10 lines of log:"
+                tail -n 10 "$current_log" | while IFS= read -r line; do
+                    log_error "  $line"
+                done
+            fi
+            
+            # Kill any remaining processes
+            kill_existing_swarm
+            
+            restart_count=$((restart_count + 1))
+            total_restarts=$((total_restarts + 1))
+            
+            # Check for quick restarts
+            if [[ $runtime -lt $quick_restart_threshold ]]; then
+                if [[ $restart_count -ge $max_quick_restarts ]]; then
+                    log_error "Too many quick failures ($restart_count). Waiting 2 minutes..."
+                    sleep 120
+                    restart_count=0
+                fi
+            else
+                restart_count=0  # Reset for successful longer runs
+            fi
+            
+            # Safety check - prevent infinite restarts
+            if [[ $total_restarts -gt 50 ]]; then
+                log_error "Reache
