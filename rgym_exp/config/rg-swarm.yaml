@@ -17,13 +17,13 @@ training:
   num_generations: 2
   num_transplant_trees: 2
   seed: 42
-  dtype: 'float32'
+  dtype: bfloat16
 
 blockchain:
   alchemy_url: "https://gensyn-testnet.g.alchemy.com/public"
-  swarm_contract_address: ${oc.env:SWARM_CONTRACT,null} # This is set by modal-login in run_rl_swarm.sh
-  org_id: ${oc.env:ORG_ID,null} # This is set by modal-login in run_rl_swarm.sh
-  mainnet_chain_id: 685685 # currently unused, will be used with WalletSwarmCoordinator
+  swarm_contract_address: ${oc.env:SWARM_CONTRACT,null}
+  org_id: ${oc.env:ORG_ID,null}
+  mainnet_chain_id: 685685
   modal_proxy_url: "http://localhost:3000/api/"
   swarm_coordinator_abi_path: "rgym_exp/contracts/SwarmCoordinator_0.4.2.json"
 
@@ -69,7 +69,19 @@ game_manager:
     _target_: rgym_exp.src.trainer.GRPOTrainerModule
     models:
       - _target_: transformers.AutoModelForCausalLM.from_pretrained
-        pretrained_model_name_or_path: ${oc.env:MODEL_NAME, ${gpu_model_choice:${default_large_model_pool},${default_small_model_pool}}} 
+        pretrained_model_name_or_path: ${oc.env:MODEL_NAME,Qwen/Qwen2.5-3B-Instruct}
+        device_map: auto
+        torch_dtype: ${training.dtype}
+        quantization_config:
+          _target_: transformers.BitsAndBytesConfig
+          load_in_4bit: true
+          bnb_4bit_compute_dtype: ${training.dtype}
+          bnb_4bit_use_double_quant: true
+          bnb_4bit_quant_type: nf4
+    tokenizer:
+      _target_: transformers.AutoTokenizer.from_pretrained
+      pretrained_model_name_or_path: ${oc.env:MODEL_NAME,Qwen/Qwen2.5-3B-Instruct}
+      use_fast: true
     config:
       _target_: genrl.trainer.grpo_trainer.GRPOTrainerConfig
       dtype: ${training.dtype}
@@ -103,34 +115,9 @@ game_manager:
     swarm_coordinator_abi_json: ${blockchain.swarm_coordinator_abi_path}
 
 default_large_model_pool: 
-  - nvidia/AceInstruct-1.5B
-  - dnotitia/Smoothie-Qwen3-1.7B
-  - Gensyn/Qwen2.5-1.5B-Instruct
+  - unsloth/Phi-4-mini-reasoning-unsloth-bnb-4bit
+  - unsloth/Qwen2.5-3B-Instruct-bnb-4bit
 
 default_small_model_pool:
   - Gensyn/Qwen2.5-0.5B-Instruct
   - Qwen/Qwen3-0.6B
-
-
-# === Added by patch: Enable BNB 4-bit with transformers + bitsandbytes ===
-trainer:
-  _target_: rgym_exp.src.trainer.GRPOTrainerModule
-  # Instantiate a 4-bit quantized model via Transformers + BitsAndBytes
-  models:
-    - _target_: transformers.AutoModelForCausalLM.from_pretrained
-      pretrained_model_name_or_path: ${oc.env:MODEL_NAME, Gensyn/Qwen2.5-1.5B-Instruct}
-      device_map: auto
-      torch_dtype: bfloat16
-      load_in_4bit: true
-      quantization_config:
-        _target_: transformers.BitsAndBytesConfig
-        load_in_4bit: true
-        bnb_4bit_compute_dtype: bfloat16
-        bnb_4bit_use_double_quant: true
-        bnb_4bit_quant_type: nf4
-
-  # (Optional) Provide a tokenizer; many pipelines expect it
-  tokenizer:
-    _target_: transformers.AutoTokenizer.from_pretrained
-    pretrained_model_name_or_path: ${oc.env:MODEL_NAME, Gensyn/Qwen2.5-1.5B-Instruct}
-    use_fast: true
