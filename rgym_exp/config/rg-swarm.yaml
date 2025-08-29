@@ -109,3 +109,28 @@ default_large_model_pool:
 
 default_small_model_pool:
   - Gensyn/Qwen2.5-0.5B-Instruct
+  - Qwen/Qwen3-0.6B
+
+
+# === Added by patch: Enable BNB 4-bit with transformers + bitsandbytes ===
+trainer:
+  _target_: rgym_exp.src.trainer.GRPOTrainerModule
+  # Instantiate a 4-bit quantized model via Transformers + BitsAndBytes
+  models:
+    - _target_: transformers.AutoModelForCausalLM.from_pretrained
+      pretrained_model_name_or_path: ${oc.env:MODEL_NAME, Gensyn/Qwen2.5-1.5B-Instruct}
+      device_map: auto
+      torch_dtype: bfloat16
+      load_in_4bit: true
+      quantization_config:
+        _target_: transformers.BitsAndBytesConfig
+        load_in_4bit: true
+        bnb_4bit_compute_dtype: bfloat16
+        bnb_4bit_use_double_quant: true
+        bnb_4bit_quant_type: nf4
+
+  # (Optional) Provide a tokenizer; many pipelines expect it
+  tokenizer:
+    _target_: transformers.AutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: ${oc.env:MODEL_NAME, Gensyn/Qwen2.5-1.5B-Instruct}
+    use_fast: true
