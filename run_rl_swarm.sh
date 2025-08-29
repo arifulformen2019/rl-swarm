@@ -425,6 +425,7 @@ install_python_deps() {
     local packages=(
         "gensyn-genrl==${GENRL_TAG}"
         "reasoning-gym>=0.1.20"
+        "trl==0.19.1"
         "hivemind@git+https://github.com/gensyn-ai/hivemind@639c964a8019de63135a2594663b5bec8e5356dd"
     )
     
@@ -794,4 +795,16 @@ main() {
             
             # Safety check - prevent infinite restarts
             if [[ $total_restarts -gt 50 ]]; then
-                log_error "Reache
+                log_error "Reached maximum restart limit (50). Exiting."
+                exit 1
+            fi
+        fi
+    done
+    
+    log_info "Training session completed after $total_restarts restarts"
+    
+    wait  # Keep script running until Ctrl+C
+}
+
+# Execute main function
+main "$@"
