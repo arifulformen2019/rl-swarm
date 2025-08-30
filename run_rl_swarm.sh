@@ -132,7 +132,27 @@ setup_docker_volumes() {
         done
     fi
 }
-
+# Enhanced system limits setup
+setup_system_limits() {
+    log_info "Setting up system limits to prevent resource errors..."
+    
+    # Increase file descriptor limits
+    ulimit -n 65536 2>/dev/null || {
+        log_warn "Failed to increase file descriptor limit"
+    }
+    
+    # Increase process limits
+    ulimit -u 32768 2>/dev/null || {
+        log_warn "Failed to increase process limit"
+    }
+    
+    # Set memory overcommit to prevent allocation failures
+    echo 1 | sudo tee /proc/sys/vm/overcommit_memory >/dev/null 2>&1 || {
+        log_debug "Could not set memory overcommit (may need sudo)"
+    }
+    
+    log_info "System limits configured"
+}
 
 # =============================================================================
 # Cloudflared Installation and Management
@@ -584,6 +604,7 @@ main() {
     display_banner
     init_directories
     setup_docker_volumes
+    setup_system_limits
     
     # Testnet connection setup
     if [[ "$CONNECT_TO_TESTNET" == "true" ]]; then
