@@ -133,27 +133,6 @@ setup_docker_volumes() {
     fi
 }
 
-# Enhanced system limits setup
-setup_system_limits() {
-    log_info "Setting up system limits to prevent resource errors..."
-    
-    # Increase file descriptor limits
-    ulimit -n 65536 2>/dev/null || {
-        log_warn "Failed to increase file descriptor limit"
-    }
-    
-    # Increase process limits
-    ulimit -u 32768 2>/dev/null || {
-        log_warn "Failed to increase process limit"
-    }
-    
-    # Set memory overcommit to prevent allocation failures
-    echo 1 | sudo tee /proc/sys/vm/overcommit_memory >/dev/null 2>&1 || {
-        log_debug "Could not set memory overcommit (may need sudo)"
-    }
-    
-    log_info "System limits configured"
-}
 
 # =============================================================================
 # Cloudflared Installation and Management
@@ -559,43 +538,16 @@ get_user_preferences() {
 # Enhanced Error Handling and Process Management
 # =============================================================================
 
-# Kill existing swarm processes with better detection
-kill_existing_swarm() {
-    log_warn "Killing existing swarm launcher processes..."
-    
-    # Kill by process name pattern
-    pkill -9 -f rgym_exp.runner.swarm_launcher 2>/dev/null || true
-    
-    # Kill related Python processes that might be stuck
-    pkill -9 -f "hivemind.*dht" 2>/dev/null || true
-    pkill -9 -f "python.*swarm" 2>/dev/null || true
-    
-    # Wait and verify
-    sleep 3
-    
-    # Double check and force kill if needed
-    local remaining_pids=$(pgrep -f rgym_exp.runner.swarm_launcher 2>/dev/null || true)
-    if [[ -n "$remaining_pids" ]]; then
-        log_warn "Force killing remaining processes: $remaining_pids"
-        echo "$remaining_pids" | xargs -r kill -9 2>/dev/null || true
-    fi
-    
-    log_info "Process cleanup completed"
-}
-
 # Handle interruption signals
 handle_interrupt() {
     log_warn "Received interrupt signal (Ctrl+C)..."
-    kill_existing_swarm
     cleanup
 }
 
 cleanup() {
     log_info "Shutting down trainer..."
-    kill_existing_swarm
     cleanup_cloudflared
     cleanup_server
-    
     exit 0
 }
 
@@ -632,7 +584,6 @@ main() {
     display_banner
     init_directories
     setup_docker_volumes
-    setup_system_limits
     
     # Testnet connection setup
     if [[ "$CONNECT_TO_TESTNET" == "true" ]]; then
@@ -659,11 +610,8 @@ main() {
     echo_blue ">> And remember to star the repo on GitHub! --> https://github.com/gensyn-ai/rl-swarm"
     
     # Launch the swarm with enhanced monitoring
-    log_info "Launching RL-Swarm with enhanced error monitoring..."
     while true; do
         log_info "Starting swarm launcher..."
-        pkill -f "python.*rgym_exp.runner.swarm_launcher" 2>/tmp/swarm_launcher_pkill.log || true
-        sleep 1
         # Run the swarm launcher
         python -m rgym_exp.runner.swarm_launcher \
             --config-path "$ROOT/rgym_exp/config" \
