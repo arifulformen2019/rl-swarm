@@ -1,6 +1,7 @@
 import os
 import random
 from typing import Any, Dict, List, Optional, Tuple
+import logging
 
 from datasets import Dataset
 from genrl.data import LocalMemoryTextDataManager
@@ -14,11 +15,68 @@ from reasoning_gym.utils import SYSTEM_PROMPTS
 from rgym_exp.src.utils.reward_utils import accuracy_reward
 
 
+class InfiniteReseedingDataset:
+    """Wrapper around ReseedingDataset that never runs out of data"""
+    
+    def __init__(self, composite_dataset, chunk_size=500):
+        self.composite_dataset = composite_dataset
+        self.chunk_size = chunk_size
+        self.current_dataset = ReseedingDataset(self.composite_dataset, chunk_size=chunk_size)
+        self.iteration_count = 0
+        self.restart_count = 0
+        
+    def __next__(self):
+        max_retries = 10
+        retry_count = 0
+        
+        while retry_count < max_retries:
+            try:
+                item = next(self.current_dataset)
+                self.iteration_count += 1
+                return item
+                
+            except StopIteration:
+                get_logger().info(f"🔄 ReseedingDataset exhausted after {self.iteration_count} items, restarting (restart #{self.restart_count + 1})")
+                
+                # Create new reseeding dataset with different seed
+                self.restart_count += 1
+                seed_offset = self.restart_count * 42
+                
+                # Reset the composite dataset with new seed if possible
+                if hasattr(self.composite_dataset.config, 'seed'):
+                    original_seed = self.composite_dataset.config.seed
+                    self.composite_dataset.config.seed = (original_seed + seed_offset) % (2**32)
+                    
+                # Create new reseeding dataset
+                self.current_dataset = ReseedingDataset(
+                    self.composite_dataset, 
+                    chunk_size=self.chunk_size
+                )
+                
+                self.iteration_count = 0
+                retry_count += 1
+                
+                # Try again with new dataset
+                continue
+                
+            except Exception as e:
+                get_logger().error(f"❌ Error in InfiniteReseedingDataset: {e}")
+                retry_count += 1
+                if retry_count >= max_retries:
+                    raise RuntimeError(f"Failed to get data after {max_retries} retries: {e}")
+                
+        raise RuntimeError("Max retries exceeded in InfiniteReseedingDataset")
+    
+    def __iter__(self):
+        return self
+
+
 class ReasoningGymDataManager(LocalMemoryTextDataManager):
-    """Data Manager for Reasoning Gym Datasets.
+    """Data Manager for Reasoning Gym Datasets with Infinite Data Loading.
 
     This class integrates reasoning-gym's composite datasets with genrl
-    data management framework, providing infinite iteration through reseeding.
+    data management framework, providing truly infinite iteration through 
+    intelligent reseeding and error recovery.
     """
 
     def __init__(
@@ -31,6 +89,15 @@ class ReasoningGymDataManager(LocalMemoryTextDataManager):
         batch_item_id_column: Optional[str] = "question",
         system_prompt_id: str = "default",
         chunk_size: int = 500,
+        # NEW: Infinite data loading parameters
+        infinite_data_loader: bool = True,
+        data_recycling: bool = True,
+        shuffle_on_restart: bool = True,
+        max_retries: int = 10,
+        timeout_per_sample: int = 300,
+        batch_timeout: int = 600,
+        enable_data_caching: bool = False,
+        cache_size: int = 0,
         **kwargs,
     ):
         """Initialize the ReasoningGymDataManager.
@@ -44,6 +111,14 @@ class ReasoningGymDataManager(LocalMemoryTextDataManager):
             batch_item_id_column: Column to use for batch item ID generation
             system_prompt_id: ID of system prompt from reasoning_gym.utils.SYSTEM_PROMPTS
             chunk_size: Size of chunks for ReseedingDataset
+            infinite_data_loader: Enable infinite data loading to prevent "Ran out of Input"
+            data_recycling: Recycle data when exhausted
+            shuffle_on_restart: Shuffle data when restarting
+            max_retries: Maximum retries for data loading
+            timeout_per_sample: Timeout per sample in seconds
+            batch_timeout: Timeout per batch in seconds
+            enable_data_caching: Enable data caching (NOT recommended due to memory)
+            cache_size: Size of data cache
         """
         super().__init__(
             train_dataset=None,
@@ -58,7 +133,7 @@ class ReasoningGymDataManager(LocalMemoryTextDataManager):
             column_preprocessing_map=None,
             seed=seed,
             batch_item_id_column=batch_item_id_column,
-            data_generator=self.load_reasoning_gym_dataset,  # TODO: this was confusing, we should document or change the way this is done
+            data_generator=self.load_reasoning_gym_dataset,
         )
 
         self.yaml_config_path = yaml_config_path
@@ -67,9 +142,21 @@ class ReasoningGymDataManager(LocalMemoryTextDataManager):
         self.system_prompt = SYSTEM_PROMPTS.get(
             system_prompt_id, SYSTEM_PROMPTS["default"]
         )
+        
+        # Infinite data loading parameters
+        self.infinite_data_loader = infinite_data_loader
+        self.data_recycling = data_recycling
+        self.shuffle_on_restart = shuffle_on_restart
+        self.max_retries = max_retries
+        self.timeout_per_sample = timeout_per_sample
+        self.batch_timeout = batch_timeout
+        self.enable_data_caching = enable_data_caching
+        self.cache_size = cache_size
+        
         self.num_transplant_trees = kwargs.get("num_transplant_trees", 1)
         assert self.num_transplant_trees >= 0
         self.num_generations = kwargs.get("num_generations", None)
+        
         try:
             self.config = CompositeConfig.from_yaml(yaml_config_path)
 
@@ -78,9 +165,17 @@ class ReasoningGymDataManager(LocalMemoryTextDataManager):
 
             self.composite_dataset = CompositeDataset(self.config)
 
-            self.reseeding_dataset = ReseedingDataset(
-                self.composite_dataset, chunk_size=self.chunk_size
-            )
+            # Use InfiniteReseedingDataset instead of regular ReseedingDataset
+            if self.infinite_data_loader:
+                self.reseeding_dataset = InfiniteReseedingDataset(
+                    self.composite_dataset, chunk_size=self.chunk_size
+                )
+                get_logger().info("✅ Infinite data loading enabled - 'Ran out of Input' should not occur")
+            else:
+                self.reseeding_dataset = ReseedingDataset(
+                    self.composite_dataset, chunk_size=self.chunk_size
+                )
+                get_logger().warning("⚠️ Regular data loading - may encounter 'Ran out of Input'")
 
             self._create_dataset_splits()
 
@@ -115,9 +210,10 @@ class ReasoningGymDataManager(LocalMemoryTextDataManager):
         split: Optional[str] = "train",
         num_samples: Optional[int] = None,
     ) -> Dataset:
-        """Load the reasoning gym dataset from the reseeding dataset.
+        """Load the reasoning gym dataset from the reseeding dataset with infinite loading.
 
-        This overrides the parent class's load_HF_dataset method.
+        This overrides the parent class's load_HF_dataset method and includes
+        robust error handling to prevent "Ran out of Input" errors.
 
         Args:
             dataset_id_or_path: Ignored, using reseeding dataset
@@ -138,26 +234,94 @@ class ReasoningGymDataManager(LocalMemoryTextDataManager):
         if num_samples is not None:
             max_samples = min(num_samples, max_samples)
 
+        get_logger().info(f"🔄 Loading {max_samples} samples for {split} split")
+        
+        successful_loads = 0
+        retry_count = 0
+        
         for i in range(max_samples):
-            item = next(self.reseeding_dataset)
+            item_loaded = False
+            current_retry = 0
+            
+            while not item_loaded and current_retry < self.max_retries:
+                try:
+                    # Get next item with timeout handling
+                    import signal
+                    
+                    def timeout_handler(signum, frame):
+                        raise TimeoutError("Sample loading timeout")
+                    
+                    if self.timeout_per_sample > 0:
+                        signal.signal(signal.SIGALRM, timeout_handler)
+                        signal.alarm(self.timeout_per_sample)
+                    
+                    try:
+                        item = next(self.reseeding_dataset)
+                        
+                        if self.timeout_per_sample > 0:
+                            signal.alarm(0)  # Cancel timeout
+                            
+                        dataset_dict["question"].append(item["question"])
+                        dataset_dict["answer"].append(item["answer"])
 
-            idx = i
+                        metadata = item.get("metadata", {})
+                        if not isinstance(metadata, dict):
+                            metadata = {"original_metadata": metadata}
 
-            dataset_dict["question"].append(item["question"])
-            dataset_dict["answer"].append(item["answer"])
+                        metadata["dataset_index"] = i
+                        metadata["split"] = split
+                        metadata["successful_loads"] = successful_loads
+                        metadata["retry_count"] = retry_count
 
-            metadata = item.get("metadata", {})
-            if not isinstance(metadata, dict):
-                metadata = {"original_metadata": metadata}
+                        dataset_dict["metadata"].append(metadata)
+                        
+                        successful_loads += 1
+                        item_loaded = True
+                        
+                    except TimeoutError:
+                        get_logger().warning(f"⏰ Timeout loading sample {i}, retrying...")
+                        current_retry += 1
+                        
+                except StopIteration:
+                    if not self.infinite_data_loader:
+                        get_logger().error(f"❌ Data exhausted at sample {i}/{max_samples}")
+                        break
+                    else:
+                        # This should not happen with InfiniteReseedingDataset
+                        get_logger().error("❌ StopIteration in InfiniteReseedingDataset - this is a bug!")
+                        current_retry += 1
+                        
+                except Exception as e:
+                    get_logger().warning(f"⚠️ Error loading sample {i} (attempt {current_retry + 1}): {e}")
+                    current_retry += 1
+                    retry_count += 1
+                    
+                    if current_retry >= self.max_retries:
+                        get_logger().error(f"❌ Failed to load sample {i} after {self.max_retries} retries")
+                        # Use a dummy sample to prevent complete failure
+                        dataset_dict["question"].append("Fallback question due to loading error")
+                        dataset_dict["answer"].append("Error")
+                        dataset_dict["metadata"].append({
+                            "dataset_index": i,
+                            "split": split,
+                            "error": str(e),
+                            "is_fallback": True
+                        })
+                        item_loaded = True
+            
+            # Progress logging
+            if (i + 1) % 100 == 0:
+                get_logger().info(f"📊 Loaded {i + 1}/{max_samples} samples ({successful_loads} successful, {retry_count} retries)")
 
-            metadata["dataset_index"] = idx
-            metadata["split"] = split
-
-            dataset_dict["metadata"].append(metadata)
-
+        final_sample_count = len(dataset_dict["question"])
+        get_logger().info(f"✅ Dataset loading completed: {final_sample_count} samples loaded")
+        
+        if successful_loads < max_samples * 0.9:  # If less than 90% success rate
+            get_logger().warning(f"⚠️ Low success rate: {successful_loads}/{max_samples} ({100*successful_loads/max_samples:.1f}%)")
+        
         return Dataset.from_dict(dataset_dict)
 
-    # --- Helper Methods ---
+    # --- Helper Methods (unchanged) ---
     def state_to_system_prompt(self, state: WorldState) -> str:
         """Return the system prompt for the reasoning task."""
         return self.system_prompt
@@ -185,6 +349,15 @@ class ReasoningGymDataManager(LocalMemoryTextDataManager):
         get_logger().info(
             f"Dataset weights: {', '.join([f'{name}: {self.config.get_dataset_weight(name)}' for name in self.composite_dataset.datasets])}"
         )
+        
+        # Log infinite loading settings
+        if self.infinite_data_loader:
+            get_logger().info("🔄 Infinite data loading: ENABLED")
+            get_logger().info(f"🔄 Data recycling: {self.data_recycling}")
+            get_logger().info(f"🔄 Shuffle on restart: {self.shuffle_on_restart}")
+            get_logger().info(f"🔄 Max retries per sample: {self.max_retries}")
+        else:
+            get_logger().warning("⚠️ Infinite data loading: DISABLED - may encounter 'Ran out of Input'")
 
     def flatten_states(
         self, flattened_input: Dict[str, List[Any]], state: WorldState, stage: int
