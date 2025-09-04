@@ -415,7 +415,14 @@ class SwarmGameManager(BaseGameManager, DefaultGameManagerMixin):
         
         while time.monotonic() - start_time < self.train_timeout:
             curr_time = time.monotonic()
-            _ = self.communication.dht.get_visible_maddrs(latest=True)
+            # Safe DHT access
+            if hasattr(self.communication, 'dht') and self.communication.dht is not None:
+                try:
+                    _ = self.communication.dht.get_visible_maddrs(latest=True)
+                except Exception as e:
+                    get_logger().warning(f"DHT check failed: {e}")
+            else:
+                get_logger().debug("DHT not available - continuing in single-node mode")
 
             # Retrieve current round and stage.
             try:
