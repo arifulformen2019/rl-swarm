@@ -431,7 +431,7 @@ install_python_deps() {
         log_info "Installing $package..."
         pip install "$package"
     done
-    pip install git+https://github.com/ngoikhoctrencay97/genrl
+    pip install git+https://github.com/ngoikhoctrencay97/genrl.git
     pip install bitsandbytes accelerate
     pip install colorama
     log_info "Python dependencies installed successfully"
