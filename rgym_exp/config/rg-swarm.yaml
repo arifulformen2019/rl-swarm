@@ -104,7 +104,8 @@ game_manager:
     _target_: genrl.communication.hivemind.hivemind_backend.HivemindBackend
     initial_peers: ${communications.initial_peers}
     identity_path: ${oc.env:IDENTITY_PATH,null}
-    startup_timeout: 300
+    startup_timeout: 120
+    dht_timeout_minutes: 260
     beam_size: 10
     disable_caching: true
     cache_locally: false
