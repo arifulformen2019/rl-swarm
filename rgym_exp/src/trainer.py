@@ -1,5 +1,5 @@
 from typing import Any, Optional, List
-
+import gc
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from genrl.data import DataManager
@@ -40,9 +40,21 @@ class GRPOTrainerModule(GRPOLanguageTrainerModule, LoggerMixin):
             models: List containing the model to be trained.
             **kwargs: Additional arguments for configuration.
         """
-        # Patch: load the model with 4-bit quantization if not already provided
+        # Check and fix quantization for existing models
+        if models:
+            for i, model in enumerate(models):
+                is_quantized = self._is_model_quantized(model)
+                
+                if not is_quantized:
+                    get_logger().warning(f"Model {i} is not quantized, reloading...")
+                    try:
+                        models[i] = self._reload_with_quantization(model, kwargs)
+                    except Exception as e:
+                        get_logger().error(f"Failed to reload model {i}: {e}")
+
+        # Fallback: load model with quantization if no models provided
         if not models:
-            model_id = kwargs.get("model_id", "Qwen2.5-3B-Instruct-bnb-4bit")
+            model_id = kwargs.get("model_id", "Qwen/Qwen2.5-3B-Instruct")
             bnb_config = BitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_quant_type="nf4",
@@ -66,24 +78,78 @@ class GRPOTrainerModule(GRPOLanguageTrainerModule, LoggerMixin):
         judge_base_url = kwargs.get("judge_base_url", None)
         self.judge_client = JudgeClient(judge_base_url) if judge_base_url else None
 
+    def _is_model_quantized(self, model) -> bool:
+        """Check if model is quantized"""
+        # Check BnB attributes
+        if hasattr(model, 'is_quantized') and model.is_quantized:
+            return True
+        if hasattr(model, 'is_loaded_in_4bit') and model.is_loaded_in_4bit:
+            return True
+        
+        # Check quantization config
+        if (hasattr(model, 'config') and 
+            hasattr(model.config, 'quantization_config') and 
+            model.config.quantization_config is not None):
+            qconfig = model.config.quantization_config
+            if hasattr(qconfig, 'load_in_4bit') and qconfig.load_in_4bit:
+                return True
+        
+        # Check parameter dtypes (quantized models have int/uint params)
+        int_params = 0
+        total_params = 0
+        for param in model.parameters():
+            total_params += param.numel()
+            if 'int' in str(param.dtype).lower():
+                int_params += param.numel()
+        
+        return total_params > 0 and int_params / total_params > 0.1
+
+    def _reload_with_quantization(self, model, kwargs):
+        """Reload model with 4-bit quantization"""
+        model_name = getattr(model, 'name_or_path', kwargs.get("model_id", "Qwen/Qwen2.5-3B-Instruct"))
+        
+        # Clear GPU memory
+        if hasattr(model, 'cpu'):
+            model.cpu()
+        del model
+        gc.collect()
+        torch.cuda.empty_cache()
+        
+        # Create quantization config
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_compute_dtype=torch.bfloat16
+        )
+        
+        # Reload with quantization
+        new_model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            quantization_config=bnb_config,
+            device_map="auto",
+            torch_dtype=torch.bfloat16
+        )
+        
+        return new_model
+
+    def _smart_cache_clear(self):
+        """Clear cache only when memory usage is high"""
+        if torch.cuda.is_available():
+            allocated_gb = torch.cuda.memory_allocated() / 1024**3
+            if allocated_gb > 3.5:
+                torch.cuda.empty_cache()
+
     def _initialize_model(self, enable_gradient_checkpointing: bool = False):
         """
         Override to handle quantized models properly.
         Quantized models cannot be cast to different dtypes.
         """
-        # Check if model is quantized (bitsandbytes)
-        is_quantized = (
-            hasattr(self.model, 'is_quantized') and self.model.is_quantized
-        ) or (
-            hasattr(self.model, 'config') and 
-            hasattr(self.model.config, 'quantization_config') and 
-            self.model.config.quantization_config is not None
-        )
+        is_quantized = self._is_model_quantized(self.model)
         
         if is_quantized:
-            # For quantized models, don't cast dtype - just ensure it's on the right device
-            get_logger().info("Model is quantized, skipping dtype casting")
-            # Model should already be on correct device due to device_map="auto"
+            # For quantized models, don't cast dtype
+            pass
         else:
             # For regular models, apply the normal dtype casting
             self.model = self.model.to(device=self.device, dtype=self.dtype)
@@ -126,12 +192,14 @@ class GRPOTrainerModule(GRPOLanguageTrainerModule, LoggerMixin):
             return_tensors="pt",
         )
 
-        # TODO: Make the dtype changes from genrl here?
         input_ids = input_ids.to(self.model.device)
         outputs = self.model.generate(input_ids, max_new_tokens=512)
         answer = self.processing_class.decode(
             outputs[0], skip_special_tokens=True
         )
+        
+        # Clear cache after evaluation
+        self._smart_cache_clear()
         
         # Submit answer to judge service
         self.judge_client.submit_answer(
@@ -169,8 +237,6 @@ class GRPOTrainerModule(GRPOLanguageTrainerModule, LoggerMixin):
         # malformed input
         if not clue or not isinstance(choices, list) or not choices:
             return {'status': PRGGameStatus.ERROR}
-        
-        get_logger().info(f"New clue received for PRG: {game_clue_dict}")
 
         try:
             choices_str = ", ".join(choices)
@@ -188,7 +254,6 @@ class GRPOTrainerModule(GRPOLanguageTrainerModule, LoggerMixin):
                 return_tensors="pt",
             )
 
-            # TODO: Make the dtype changes from genrl here?
             input_ids = input_ids.to(self.model.device)
             
             # Get logits for each choice
@@ -196,6 +261,10 @@ class GRPOTrainerModule(GRPOLanguageTrainerModule, LoggerMixin):
             
             # Select the choice with highest probability
             choice_idx = torch.argmax(choice_logits).item()
+            
+            # Clear cache after logits computation
+            torch.cuda.empty_cache()
+            
             return {
                 "game_idx": game_id,
                 "clue_idx": clue_id,
@@ -215,31 +284,28 @@ class GRPOTrainerModule(GRPOLanguageTrainerModule, LoggerMixin):
         the sum of log-probabilities that the model assigns to generating
         "<answer>{choice}</answer>" after the given input_ids.
         """
-
         device = input_ids.device
         batch_size, prompt_len = input_ids.shape
         logits_list = []
 
         for choice in choices:
-            # 1) build the full token sequence: prompt + "<answer>…</answer>"
-            # TODO: Make the dtype changes from genrl here?
+            # Build the full token sequence: prompt + "<answer>…</answer>"
             answer_str = f"<answer>{choice}</answer>"
             choice_ids = self.processing_class(
                 answer_str,
                 return_tensors="pt",
                 add_special_tokens=False
-            ).input_ids.to(device)    # shape (1, L)
+            ).input_ids.to(device)
 
-            seq = torch.cat([input_ids, choice_ids], dim=1)  # (1, prompt_len + L)
+            seq = torch.cat([input_ids, choice_ids], dim=1)
 
-            # build labels that only include the answer positions
+            # Build labels that only include the answer positions
             labels = seq.clone()
             labels[:, :prompt_len] = -100  # ignore prompt positions in loss
             outputs = self.model(input_ids=seq, labels=labels)
-            # outputs.loss is average negative log-likelihood over the L answer tokens
 
             total_log_prob = -outputs.loss * choice_ids.size(1)
             logits_list.append(total_log_prob)
 
-        # stack into a single tensor of shape (num_choices,)
+        # Stack into a single tensor of shape (num_choices,)
         return torch.stack(logits_list)
