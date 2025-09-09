@@ -1,81 +1,20 @@
+from typing import Any, Optional, List
+import gc
 import os
-import pickle
 import time
-import threading
-import multiprocessing as mp
-from typing import Any, Dict, List
-import signal
-import sys
-
-import torch.distributed as dist
-from hivemind import DHT, get_dht_time
-
-# Import from genrl package
-from genrl.communication.communication import Communication
-from genrl.serialization.game_tree import from_bytes, to_bytes
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from genrl.data import DataManager
 from genrl.logging_utils.global_defs import get_logger
+from genrl.logging_utils.ml_logger import LoggerMixin
+from genrl.rewards import RewardManager
+from genrl.state import GameState
+from genrl.trainer.grpo_trainer import GRPOLanguageTrainerModule
+from reasoning_gym.utils import SYSTEM_PROMPTS
+from rgym_exp.src.utils.judge_client import JudgeClient
+from rgym_exp.src.prg_module import PRGGameStatus
 
-
-class HivemindRendezvouz:
-    """Local implementation of Hivemind rendezvous."""
-    _STORE = None
-    _IS_MASTER = False
-    _IS_LAMBDA = False
-    _LOCK = threading.Lock()
-
-    @classmethod
-    def init(cls, is_master: bool = False):
-        with cls._LOCK:
-            cls._IS_MASTER = is_master
-            cls._IS_LAMBDA = os.environ.get("LAMBDA", False)
-            if cls._STORE is None and cls._IS_LAMBDA:
-                world_size = int(os.environ.get("HIVEMIND_WORLD_SIZE", 1))
-                try:
-                    cls._STORE = dist.TCPStore(
-                        host_name=os.environ["MASTER_ADDR"],
-                        port=int(os.environ["MASTER_PORT"]),
-                        is_master=is_master,
-                        world_size=world_size,
-                        wait_for_workers=True,
-                        timeout=300,
-                    )
-                    get_logger().info("TCPStore initialized")
-                except Exception as e:
-                    get_logger().error(f"Failed to initialize TCPStore: {e}")
-                    cls._STORE = None
-
-    @classmethod
-    def is_bootstrap(cls) -> bool:
-        return cls._IS_MASTER
-
-    @classmethod
-    def set_initial_peers(cls, initial_peers):
-        if cls._STORE is None and cls._IS_LAMBDA:
-            cls.init()
-        if cls._IS_LAMBDA and cls._STORE is not None:
-            try:
-                cls._STORE.set("initial_peers", pickle.dumps(initial_peers))
-                get_logger().info(f"Set initial peers: {len(initial_peers)} peers")
-            except Exception as e:
-                get_logger().warning(f"Failed to set initial peers: {e}")
-
-    @classmethod
-    def get_initial_peers(cls):
-        if cls._STORE is None and cls._IS_LAMBDA:
-            cls.init()
-        if cls._STORE is not None:
-            try:
-                cls._STORE.wait(["initial_peers"], timeout=60)
-                peer_bytes = cls._STORE.get("initial_peers")
-                initial_peers = pickle.loads(peer_bytes)
-                get_logger().info(f"Got initial peers: {len(initial_peers)} peers")
-                return initial_peers
-            except Exception as e:
-                get_logger().warning(f"Failed to get initial peers: {e}")
-                return None
-        return None
-
-
+# INLINE ROBUST COMMUNICATION - No external dependencies
 class EmergencyTrainingWrapper:
     """Emergency wrapper to prevent training crashes from communication errors"""
     
@@ -129,748 +68,628 @@ class EmergencyTrainingWrapper:
             return {self.backend.get_id(): obj}
 
 
-class HivemindBackend(Communication):
-    """
-    Robust DHT backend that handles 'Ran out of input' errors gracefully.
-    Features comprehensive error recovery and emergency fallbacks.
-    """
+class FallbackBackend:
+    """Simple fallback backend for single-node operation"""
     
-    def __init__(
-        self,
-        initial_peers: List[str] | None = None,
-        timeout: int = 300,
-        startup_timeout: int = 120,
-        disable_caching: bool = True,
-        beam_size: int = 20,
-        max_retries: int = 3,
-        retry_delay: float = 2.0,
-        dht_timeout_minutes: int = 260,
-        # NEW: Enhanced error handling parameters
-        enable_robust_mode: bool = True,
-        max_pipe_errors: int = 5,
-        health_check_interval: int = 30,
-        **kwargs,
-    ):
-        # Core attributes
-        self.dht = None
-        self.world_size = int(os.environ.get("HIVEMIND_WORLD_SIZE", 1))
-        self.timeout = timeout
-        self.startup_timeout = startup_timeout
-        self.max_retries = max_retries
-        self.retry_delay = retry_delay
-        self.beam_size = min(beam_size, 50)
-        self.step_ = 0
-        self._connection_failures = 0
-        self._max_connection_failures = 5
+    def __init__(self):
+        self.agent_id = f"fallback_{os.getpid()}"
+        self.mode = "single_node_fallback"
         
-        # Enhanced error handling
-        self.enable_robust_mode = enable_robust_mode
-        self.max_pipe_errors = max_pipe_errors
-        self.health_check_interval = health_check_interval
-        self._pipe_errors = 0
-        self._last_health_check = 0
-        self._emergency_mode = False
+    def all_gather_object(self, obj):
+        return {self.agent_id: obj}
         
-        # Time management
-        self.dht_timeout_minutes = dht_timeout_minutes
-        self.dht_start_time = None
-        self.time_based_shutdown = False
-        self.time_monitor_thread = None
-        self.health_monitor_thread = None
-        self.shutdown_flag = threading.Event()
+    def safe_all_gather(self, obj):
+        return {self.agent_id: obj}
         
-        # Store for later use
-        self.initial_peers = initial_peers
-        
-        get_logger().info(f"Initializing HivemindBackend (world_size={self.world_size})")
-        get_logger().info(f"DHT timeout: {dht_timeout_minutes} minutes")
-        get_logger().info(f"Robust mode: {enable_robust_mode}")
-        
-        self._setup_multiprocessing()
-        
-        # DHT configuration
-        dht_kwargs = {
-            "cache_locally": not disable_caching,
-            "cache_on_store": False,
-            "num_workers": 1,
-            "daemon": True,  # Better cleanup
-        }
-        dht_kwargs.update(kwargs)
-        
-        self.bootstrap = self._is_bootstrap()
-        self._init_dht_or_fallback(initial_peers, **dht_kwargs)
-        self._pending_shutdown = False
-
-    def _setup_multiprocessing(self):
-        """Setup multiprocessing for stability."""
-        try:
-            mp.set_start_method('spawn', force=True)
-            get_logger().info("Set multiprocessing to 'spawn'")
-        except RuntimeError:
-            get_logger().debug("Multiprocessing method already set")
-        
-        os.environ['PYTHONUNBUFFERED'] = '1'
-        os.environ['OMP_NUM_THREADS'] = '1'
-        os.environ['MKL_NUM_THREADS'] = '1'
-
-    def _is_bootstrap(self) -> bool:
-        """Check if this is bootstrap node."""
-        return os.environ.get("HIVEMIND_BOOTSTRAP", "false").lower() == "true"
-
-    def _init_dht_or_fallback(self, initial_peers: List[str] | None, **kwargs):
-        """Try DHT initialization with enhanced error handling."""
-        
-        # Check emergency disable flags
-        if os.environ.get("DISABLE_DHT", "false").lower() == "true":
-            get_logger().warning("DHT disabled via DISABLE_DHT environment variable")
-            self._emergency_mode = True
-            self._setup_single_node_fallback()
-            return
-            
-        try:
-            self._init_dht_with_recovery(initial_peers, **kwargs)
-        except Exception as e:
-            get_logger().error(f"DHT initialization failed: {e}")
-            if self.enable_robust_mode:
-                get_logger().info("Robust mode enabled - switching to single-node fallback")
-                self._emergency_mode = True
-                self._setup_single_node_fallback()
-            else:
-                raise
-
-    def _init_dht_with_recovery(self, initial_peers: List[str] | None, **kwargs):
-        """Initialize DHT with comprehensive retry logic."""
-        
-        for attempt in range(self.max_retries):
-            try:
-                get_logger().info(f"DHT initialization attempt {attempt + 1}/{self.max_retries}")
-                
-                if self.dht:
-                    self._safe_cleanup_dht()
-                
-                if attempt > 0:
-                    delay = self.retry_delay * (2 ** (attempt - 1))
-                    get_logger().info(f"Waiting {delay}s before retry...")
-                    time.sleep(delay)
-                
-                self._init_dht_with_timeout(initial_peers, **kwargs)
-                self._verify_dht_health()
-                
-                # Success - start monitoring
-                self.dht_start_time = time.time()
-                self._start_monitoring()
-                
-                get_logger().info("=" * 60)
-                get_logger().info("TRAINING MODE: Distributed DHT (Robust)")
-                get_logger().info(f"Agent ID: {self.dht.peer_id}")
-                get_logger().info(f"DHT timeout: {self.dht_timeout_minutes} minutes")
-                get_logger().info("Error recovery: ENABLED")
-                get_logger().info("=" * 60)
-                
-                self._connection_failures = 0
-                self._pipe_errors = 0
-                return
-                
-            except Exception as e:
-                get_logger().error(f"DHT attempt {attempt + 1} failed: {e}")
-                if self.dht:
-                    self._safe_cleanup_dht()
-                
-                if attempt == self.max_retries - 1:
-                    raise RuntimeError("All DHT attempts failed")
-
-    def _start_monitoring(self):
-        """Start both time and health monitoring."""
-        self._start_time_monitoring()
-        self._start_health_monitoring()
-
-    def _start_time_monitoring(self):
-        """Start time monitoring thread."""
-        if self.time_monitor_thread and self.time_monitor_thread.is_alive():
-            return
-            
-        self.shutdown_flag.clear()
-        self.time_monitor_thread = threading.Thread(target=self._time_monitor_loop, daemon=True)
-        self.time_monitor_thread.start()
-
-    def _start_health_monitoring(self):
-        """Start health monitoring thread."""
-        if self.health_monitor_thread and self.health_monitor_thread.is_alive():
-            return
-            
-        self.health_monitor_thread = threading.Thread(target=self._health_monitor_loop, daemon=True)
-        self.health_monitor_thread.start()
-
-    def _time_monitor_loop(self):
-        """Monitor DHT runtime and shutdown after timeout."""
-        last_log_minute = 0
-        
-        while not self.shutdown_flag.is_set() and self.dht and not self.time_based_shutdown:
-            if self.dht_start_time:
-                elapsed_minutes = (time.time() - self.dht_start_time) / 60
-                
-                if elapsed_minutes >= self.dht_timeout_minutes:
-                    self._pending_shutdown = True
-                    get_logger().info(f"DHT timeout reached: {elapsed_minutes:.1f} minutes")
-                    self._preserve_peer_id_and_shutdown()
-                    break
-                
-                # Log every 10 minutes
-                current_minute = int(elapsed_minutes)
-                if current_minute % 10 == 0 and current_minute > last_log_minute and current_minute > 0:
-                    remaining = self.dht_timeout_minutes - elapsed_minutes
-                    get_logger().info(f"DHT runtime: {elapsed_minutes:.1f}min, {remaining:.1f}min remaining")
-                    last_log_minute = current_minute
-            
-            self.shutdown_flag.wait(30)
-
-    def _health_monitor_loop(self):
-        """Monitor DHT process health and detect pipe failures."""
-        while not self.shutdown_flag.is_set() and self.dht and not self.time_based_shutdown:
-            try:
-                current_time = time.time()
-                
-                # Periodic health check
-                if current_time - self._last_health_check > self.health_check_interval:
-                    if not self._check_dht_health():
-                        get_logger().error("DHT health check failed - triggering recovery")
-                        self._handle_critical_failure("Health check failed")
-                        break
-                    self._last_health_check = current_time
-                
-                # Check process status
-                if hasattr(self.dht, '_server_process'):
-                    if not self.dht._server_process.is_alive():
-                        get_logger().error("DHT process died")
-                        self._handle_critical_failure("DHT process died")
-                        break
-                
-                # Check pipe status
-                if hasattr(self.dht, '_outer_pipe') and self.dht._outer_pipe.closed:
-                    get_logger().error("DHT pipe closed")
-                    self._handle_critical_failure("DHT pipe closed")
-                    break
-                    
-            except Exception as e:
-                get_logger().warning(f"Health monitor error: {e}")
-                
-            self.shutdown_flag.wait(10)  # Check every 10 seconds
-
-    def _check_dht_health(self) -> bool:
-        """Comprehensive DHT health check."""
-        if not self.dht:
-            return False
-            
-        try:
-            # Try to get visible addresses - this tests basic DHT functionality
-            self.dht.get_visible_maddrs(latest=True)
-            return True
-        except Exception as e:
-            get_logger().warning(f"DHT health check failed: {e}")
-            return False
-
-    def _handle_critical_failure(self, reason: str):
-        """Handle critical DHT failures."""
-        self._pipe_errors += 1
-        get_logger().error(f"Critical failure #{self._pipe_errors}: {reason}")
-        
-        if self._pipe_errors >= self.max_pipe_errors or not self.enable_robust_mode:
-            get_logger().error("Too many critical failures - entering emergency mode")
-            self._emergency_mode = True
-            self._preserve_peer_id_and_shutdown()
-        else:
-            get_logger().info("Attempting recovery from critical failure")
-            # Trigger recovery in next gather call
-
-    def _preserve_peer_id_and_shutdown(self):
-        """Preserve peer_id before shutting down DHT."""
-        self._pending_shutdown = False
-        get_logger().info("=" * 60)
-        get_logger().info("DHT SHUTDOWN: Preserving identity and switching to single-node")
-        get_logger().info("=" * 60)
-        
-        # Mark as time-based shutdown
-        self.time_based_shutdown = True
-        
-        # PRESERVE peer_id BEFORE shutdown
-        if self.dht and hasattr(self.dht, 'peer_id'):
-            self._persistent_peer_id = str(self.dht.peer_id)
-            get_logger().info(f"Preserved peer_id: {self._persistent_peer_id}")
-        
-        # Shutdown DHT safely
-        self._safe_cleanup_dht()
-        
-        # Stop monitoring
-        self.shutdown_flag.set()
-        
-        # Log new mode
-        get_logger().info("=" * 60)
-        get_logger().info("TRAINING MODE: Single-node (preserved identity)")
-        get_logger().info(f"Agent ID: {self.get_id()}")
-        get_logger().info("Identity: Preserved from DHT")
-        get_logger().info("Data consistency: Maintained")
-        get_logger().info("=" * 60)
-
-    def _setup_single_node_fallback(self):
-        """Setup single-node mode when DHT initialization fails."""
-        get_logger().info("=" * 60)
-        get_logger().info("TRAINING MODE: Single-node (DHT init failed)")
-        get_logger().info(f"Agent ID: {self.get_id()}")
-        get_logger().info("Identity: Process-based fallback")
-        get_logger().info("=" * 60)
-
-    def _init_dht_with_timeout(self, initial_peers, **kwargs):
-        """Initialize DHT with enhanced error handling."""
-        
-        host_maddrs = ["/ip4/0.0.0.0/tcp/0"]
-        
-        if self.bootstrap:
-            get_logger().info("Starting as bootstrap node")
-            self.dht = DHT(
-                start=True,
-                host_maddrs=host_maddrs,
-                initial_peers=initial_peers or [],
-                startup_timeout=self.startup_timeout,
-                **kwargs
-            )
-            
-            try:
-                dht_maddrs = self.dht.get_visible_maddrs(latest=True)
-                HivemindRendezvouz.set_initial_peers(dht_maddrs)
-            except Exception as e:
-                get_logger().warning(f"Failed to set rendezvous peers: {e}")
-                
-        else:
-            get_logger().info("Starting as worker node")
-            
-            resolved_peers = initial_peers
-            if not resolved_peers:
-                resolved_peers = HivemindRendezvouz.get_initial_peers()
-            if not resolved_peers:
-                resolved_peers = []
-            
-            get_logger().info(f"Connecting to {len(resolved_peers)} peers")
-            
-            self.dht = DHT(
-                start=True,
-                host_maddrs=host_maddrs,
-                initial_peers=resolved_peers,
-                startup_timeout=self.startup_timeout,
-                **kwargs
-            )
-
-    def _verify_dht_health(self):
-        """Enhanced DHT health verification."""
-        if self.dht:
-            try:
-                # Test basic functionality
-                self.dht.get_visible_maddrs(latest=True)
-                
-                # Test process health
-                if hasattr(self.dht, '_server_process') and not self.dht._server_process.is_alive():
-                    raise RuntimeError("DHT process not alive after initialization")
-                
-                get_logger().info("DHT health check passed")
-            except Exception as e:
-                raise RuntimeError(f"DHT health check failed: {e}")
-
-    def _safe_cleanup_dht(self):
-        """Safe DHT cleanup with timeout and force termination."""
-        if not self.dht:
-            return
-            
-        try:
-            get_logger().info("Safely cleaning up DHT...")
-            
-            # Set shutdown flag
-            self.shutdown_flag.set()
-            
-            # Try graceful shutdown with timeout
-            shutdown_start = time.time()
-            shutdown_timeout = 10
-            
-            try:
-                self.dht.shutdown()
-            except Exception as e:
-                get_logger().warning(f"DHT shutdown error: {e}")
-            
-            # Wait for processes to terminate
-            if hasattr(self.dht, '_server_process'):
-                while (self.dht._server_process.is_alive() and 
-                       time.time() - shutdown_start < shutdown_timeout):
-                    time.sleep(0.5)
-                
-                # Force terminate if still alive
-                if self.dht._server_process.is_alive():
-                    get_logger().warning("Force terminating DHT process")
-                    try:
-                        self.dht._server_process.terminate()
-                        time.sleep(2)
-                        if self.dht._server_process.is_alive():
-                            self.dht._server_process.kill()
-                    except Exception as e:
-                        get_logger().warning(f"Force termination error: {e}")
-            
-            get_logger().info("DHT cleanup completed")
-            
-        except Exception as e:
-            get_logger().warning(f"DHT cleanup error: {e}")
-        finally:
-            self.dht = None
-
-    def all_gather_object(self, obj: Any) -> Dict[str | int, Any]:
-        """Ultra-robust all_gather with comprehensive error handling."""
-        
-        # EMERGENCY EXIT: Force single-node via environment
-        if os.environ.get("FORCE_SINGLE_NODE", "false").lower() == "true":
-            get_logger().debug("FORCE_SINGLE_NODE enabled - skipping distributed gather")
-            return {self.get_id(): obj}
-        
-        # EMERGENCY MODE: Switch to single-node after critical failures
-        if self._emergency_mode:
-            get_logger().debug(f"Emergency mode - single-node processing (agent: {self.get_id()})")
-            return {self.get_id(): obj}
-        
-        # PENDING SHUTDOWN: Handle graceful shutdown
-        if hasattr(self, '_pending_shutdown') and self._pending_shutdown:
-            get_logger().info("Pending shutdown detected - switching to single-node")
-            self._preserve_peer_id_and_shutdown()
-            return {self.get_id(): obj}
-        
-        # NO DHT: Use single-node mode
-        if (self.time_based_shutdown or 
-            not self.dht or 
-            not hasattr(self.dht, 'peer_id')):
-            agent_id = self.get_id()
-            get_logger().debug(f"Single-node processing (agent: {agent_id})")
-            return {agent_id: obj}
-        
-        # DISTRIBUTED GATHERING with error recovery
-        key = f"gather_{self.step_}"
-        
-        for attempt in range(self.max_retries):
-            try:
-                result = self._attempt_distributed_gather_robust(obj, key)
-                self.step_ += 1
-                
-                # Reset error counters on success
-                if self._connection_failures > 0:
-                    get_logger().info(f"Distributed gather recovered after {self._connection_failures} failures")
-                    self._connection_failures = 0
-                    
-                return result
-                
-            except Exception as e:
-                error_msg = str(e)
-                get_logger().warning(f"Gather attempt {attempt + 1} failed: {error_msg}")
-                
-                # Check for critical pipe/communication errors
-                critical_patterns = [
-                    "ran out of input", "pipe", "broken", "connection", "timeout",
-                    "eof", "resource temporarily unavailable", "blocking"
-                ]
-                
-                if any(pattern in error_msg.lower() for pattern in critical_patterns):
-                    get_logger().error(f"Critical DHT error: {error_msg}")
-                    self._handle_critical_failure(f"Gather error: {error_msg}")
-                    return {self.get_id(): obj}
-                
-                self._connection_failures += 1
-                
-                if self._connection_failures >= self._max_connection_failures:
-                    get_logger().error("Too many connection failures - switching to single-node")
-                    self._preserve_peer_id_and_shutdown()
-                    return {self.get_id(): obj}
-                
-                if attempt < self.max_retries - 1:
-                    delay = self.retry_delay * (attempt + 1)
-                    get_logger().info(f"Waiting {delay}s before retry...")
-                    time.sleep(delay)
-        
-        # All attempts failed - use fallback
-        get_logger().warning("All distributed gather attempts failed - using single-node fallback")
-        return {self.get_id(): obj}
-
-    def _attempt_distributed_gather_robust(self, obj: Any, key: str) -> Dict[str, Any]:
-        """Robust distributed gather with comprehensive pre-flight checks."""
-        
-        # PRE-FLIGHT CHECKS
-        if not self.dht or not hasattr(self.dht, 'peer_id'):
-            raise RuntimeError("DHT not available")
-        
-        # Check DHT process health
-        if hasattr(self.dht, '_server_process') and not self.dht._server_process.is_alive():
-            raise RuntimeError("DHT process not alive")
-        
-        # Check pipe health  
-        if hasattr(self.dht, '_outer_pipe') and self.dht._outer_pipe.closed:
-            raise RuntimeError("DHT pipe closed")
-        
-        # SERIALIZATION with error handling
-        try:
-            obj_bytes = to_bytes(obj)
-        except Exception as e:
-            raise RuntimeError(f"Serialization failed: {e}")
-        
-        # STORE with retry and pipe monitoring
-        store_success = False
-        for store_attempt in range(3):
-            try:
-                # Check pipe before store
-                if hasattr(self.dht, '_outer_pipe') and self.dht._outer_pipe.closed:
-                    raise RuntimeError("DHT pipe closed before store")
-                
-                self.dht.store(
-                    key,
-                    subkey=str(self.dht.peer_id),
-                    value=obj_bytes,
-                    expiration_time=get_dht_time() + self.timeout,
-                    beam_size=self.beam_size,
-                )
-                store_success = True
-                break
-                
-            except Exception as e:
-                error_msg = str(e)
-                get_logger().warning(f"Store attempt {store_attempt + 1} failed: {error_msg}")
-                
-                # Check for critical errors
-                if any(pattern in error_msg.lower() for pattern in [
-                    "ran out of input", "pipe", "connection reset", "eof"
-                ]):
-                    raise RuntimeError(f"Critical DHT store error: {error_msg}")
-                
-                if store_attempt < 2:
-                    time.sleep(1)
-        
-        if not store_success:
-            raise RuntimeError("Failed to store in DHT after retries")
-        
-        # Wait for propagation
-        time.sleep(min(2.0, 0.5 * self.world_size))
-        
-        # RETRIEVE with health monitoring
-        start_time = time.time()
-        best_result = {}
-        get_timeout = min(self.timeout, 60)
-        
-        while time.time() - start_time < get_timeout:
-            try:
-                # Health check before each get
-                if hasattr(self.dht, '_outer_pipe') and self.dht._outer_pipe.closed:
-                    raise RuntimeError("DHT pipe closed during retrieval")
-                
-                if hasattr(self.dht, '_server_process') and not self.dht._server_process.is_alive():
-                    raise RuntimeError("DHT process died during retrieval")
-                
-                output, _ = self.dht.get(key, beam_size=self.beam_size, latest=True)
-                
-                if output:
-                    current_result = {}
-                    for subkey, value in output.items():
-                        try:
-                            current_result[subkey] = from_bytes(value.value)
-                        except Exception as e:
-                            get_logger().debug(f"Deserialization failed for {subkey}: {e}")
-                    
-                    if len(current_result) > len(best_result):
-                        best_result = current_result
-                    
-                    # Success condition
-                    if len(current_result) >= min(self.world_size, 2):
-                        break
-                
-                time.sleep(1.0)
-                
-            except Exception as e:
-                error_msg = str(e)
-                get_logger().debug(f"DHT get failed: {error_msg}")
-                
-                # Check for critical errors during get
-                if any(pattern in error_msg.lower() for pattern in [
-                    "ran out of input", "pipe", "connection reset", "broken pipe", "eof"
-                ]):
-                    raise RuntimeError(f"Critical DHT get error: {error_msg}")
-                
-                time.sleep(2.0)
-        
-        if not best_result:
-            raise RuntimeError("No results collected from DHT")
-        
-        # Success - reset connection failure counter
-        self._connection_failures = max(0, self._connection_failures - 1)
-        return best_result
-
     def get_id(self):
-        """Get agent identifier - preserved peer_id has priority."""
-        # Priority 1: Preserved peer_id from DHT
-        if hasattr(self, '_persistent_peer_id'):
-            return self._persistent_peer_id
+        return self.agent_id
         
-        # Priority 2: Current DHT peer_id
-        if self.dht and hasattr(self.dht, 'peer_id'):
-            return str(self.dht.peer_id)
+    def get_training_mode(self):
+        return self.mode
         
-        # Priority 3: Process fallback
-        return f"node_{os.getpid()}"
-
-    def get_training_mode(self) -> str:
-        """Get current training mode with error information."""
-        if self._emergency_mode:
-            return "emergency_single_node"
-        elif self.time_based_shutdown and hasattr(self, '_persistent_peer_id'):
-            return "single_node_preserved_identity"
-        elif self.time_based_shutdown:
-            return "single_node_post_timeout"
-        elif self.dht:
-            return "distributed_dht_robust"
-        else:
-            return "single_node_fallback"
-
-    def get_status(self) -> Dict[str, Any]:
-        """Get comprehensive backend status."""
-        return {
-            "mode": self.get_training_mode(),
-            "agent_id": self.get_id(),
-            "dht_active": self.dht is not None,
-            "emergency_mode": self._emergency_mode,
-            "pipe_errors": self._pipe_errors,
-            "connection_failures": self._connection_failures,
-            "robust_mode": self.enable_robust_mode,
-            "time_status": self.get_time_status(),
-        }
-
-    def get_time_status(self) -> Dict[str, Any]:
-        """Get time status."""
-        if self.dht_start_time:
-            elapsed = (time.time() - self.dht_start_time) / 60
-            remaining = max(0, self.dht_timeout_minutes - elapsed)
-        else:
-            elapsed = remaining = 0
-            
-        return {
-            "dht_active": self.dht is not None,
-            "time_based_shutdown": self.time_based_shutdown,
-            "elapsed_minutes": round(elapsed, 1),
-            "remaining_minutes": round(remaining, 1),
-            "timeout_minutes": self.dht_timeout_minutes,
-            "has_preserved_identity": hasattr(self, '_persistent_peer_id'),
-        }
-
     def shutdown(self):
-        """Graceful shutdown with comprehensive cleanup."""
-        get_logger().info("Initiating HivemindBackend shutdown...")
-        
-        # Set shutdown flag first
-        self.shutdown_flag.set()
-        
-        # Wait for monitoring threads to finish
-        if self.time_monitor_thread and self.time_monitor_thread.is_alive():
-            self.time_monitor_thread.join(timeout=5)
-            
-        if self.health_monitor_thread and self.health_monitor_thread.is_alive():
-            self.health_monitor_thread.join(timeout=5)
-        
-        # Clean up DHT
-        self._safe_cleanup_dht()
-        
-        get_logger().info("HivemindBackend shutdown completed")
-
-    def __del__(self):
-        """Enhanced destructor with error suppression."""
-        try:
-            self.shutdown()
-        except Exception as e:
-            # Use print instead of logger as logging might be shutdown
-            print(f"Warning: Error during HivemindBackend cleanup: {e}")
+        pass
 
 
-# Factory function to create the appropriate backend
-def create_hivemind_backend(**kwargs):
-    """Factory function to create HivemindBackend with emergency wrapper."""
+def create_robust_communication_wrapper(existing_backend):
+    """Create robust wrapper around existing communication backend"""
     
-    # Check if emergency wrapper should be enabled
-    enable_wrapper = kwargs.pop('enable_emergency_wrapper', True)
+    if existing_backend is None:
+        get_logger().warning("No existing backend - creating fallback")
+        return FallbackBackend()
     
-    # Create the backend
-    backend = HivemindBackend(**kwargs)
+    # Check if it already has robust features
+    if hasattr(existing_backend, 'safe_all_gather'):
+        get_logger().info("Backend already has robust features")
+        return existing_backend
     
-    # Wrap with emergency handler if enabled
-    if enable_wrapper:
-        get_logger().info("Emergency wrapper enabled for maximum robustness")
-        return EmergencyTrainingWrapper(backend)
-    else:
-        return backend
+    # Wrap with emergency handler
+    get_logger().info("Wrapping existing backend with emergency handler")
+    return EmergencyTrainingWrapper(existing_backend)
 
 
-# Usage example and environment setup
-def setup_environment_for_robust_training():
-    """Setup environment variables for robust training."""
-    
-    # Reduce timeouts for faster failure detection
-    os.environ.setdefault('HIVEMIND_DHT_TIMEOUT', '60')  # 1 minute timeout
-    os.environ.setdefault('HIVEMIND_STARTUP_TIMEOUT', '30')  # 30 second startup
-    
-    # Enable robust mode by default
-    os.environ.setdefault('HIVEMIND_ROBUST_MODE', 'true')
-    
-    # Set reasonable retry limits
-    os.environ.setdefault('HIVEMIND_MAX_RETRIES', '3')
-    
-    # Enable emergency mode for critical failures
-    os.environ.setdefault('HIVEMIND_EMERGENCY_MODE', 'true')
-    
-    get_logger().info("Environment configured for robust Hivemind training")
-
-
-# Emergency control functions
 def emergency_disable_dht():
-    """Emergency function to disable DHT completely."""
+    """Emergency function to disable DHT completely"""
     os.environ['DISABLE_DHT'] = 'true'
+    os.environ['FORCE_SINGLE_NODE'] = 'true'
     get_logger().warning("DHT EMERGENCY DISABLED - all communication will use single-node mode")
 
 
-def emergency_force_single_node():
-    """Emergency function to force single-node mode immediately."""
-    os.environ['FORCE_SINGLE_NODE'] = 'true'
-    get_logger().warning("EMERGENCY SINGLE-NODE MODE - all gather operations forced to single-node")
+# Enhanced trainer prompts
+PRG_SYSTEM_PROMPT = """Given a question, hints, and possible answers, your task is to answer the question by thinking step-by-step in a clear and specific manner for 1 line only.
+Your answer MUST be one of the possible answers. Provide the answer in the following format:
+<answer>answer here</answer>
+Do not explain your reasoning inside the answer tags, provide only the final answer.
+"""
+
+PRG_SYSTEM_PROMPT_NO_THINKING = """Given a question, hints, and possible answers, your task is to answer the question.
+Your answer MUST be one of the possible answers. Give your answer in the following format:
+<answer>answer here</answer>
+Do not explain your reasoning at all, provide only the final answer in the answer tag.
+"""
 
 
-def check_system_health():
-    """Check system health for potential issues."""
-    issues = []
+class GRPOTrainerModule(GRPOLanguageTrainerModule, LoggerMixin):
+    """
+    Enhanced GRPO Trainer with built-in robust communication handling.
+    Works with or without external robust communication library.
+    """
+
+    def __init__(self, models: List[Any], **kwargs):
+        """
+        Initialize the GRPO trainer module with robust communication.
+        """
+        # Initialize robust communication first
+        self._init_robust_communication(kwargs)
+        
+        # Check and fix quantization for existing models
+        if models:
+            for i, model in enumerate(models):
+                is_quantized = self._is_model_quantized(model)
+                
+                if not is_quantized:
+                    get_logger().warning(f"Model {i} is not quantized, reloading...")
+                    try:
+                        models[i] = self._reload_with_quantization(model, kwargs)
+                    except Exception as e:
+                        get_logger().error(f"Failed to reload model {i}: {e}")
+
+        # Fallback: load model with quantization if no models provided
+        if not models:
+            model_id = kwargs.get("model_id", "Qwen/Qwen2.5-3B-Instruct")
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_compute_dtype=torch.bfloat16
+            )
+            tokenizer = AutoTokenizer.from_pretrained(model_id)
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
+                
+            model = AutoModelForCausalLM.from_pretrained(
+                model_id,
+                quantization_config=bnb_config,
+                device_map="auto",
+                torch_dtype=torch.bfloat16
+            )
+            models = [model]
+            self.tokenizer = tokenizer
+        
+        super().__init__(models, **kwargs)
+        judge_base_url = kwargs.get("judge_base_url", None)
+        self.judge_client = JudgeClient(judge_base_url) if judge_base_url else None
+        
+        # Communication error tracking
+        self._communication_errors = 0
+        self._emergency_mode_enabled = False
+        self._last_successful_gather = 0
+        self._step_counter = 0
+
+    def _init_robust_communication(self, kwargs):
+        """Initialize robust communication backend"""
+        
+        # Check if we're in a distributed environment
+        world_size = int(os.environ.get("HIVEMIND_WORLD_SIZE", 1))
+        is_distributed = world_size > 1
+        
+        if not is_distributed:
+            get_logger().info("Single-node environment detected - using fallback backend")
+            self._robust_backend = FallbackBackend()
+            return
+        
+        # Check for existing communication backend in parent
+        existing_backend = getattr(self, 'communication', None)
+        if existing_backend is None:
+            # Try to get from args/kwargs
+            existing_backend = kwargs.get('communication', None)
+        
+        if existing_backend is not None:
+            get_logger().info("Using existing communication backend with robust wrapper")
+            self._robust_backend = create_robust_communication_wrapper(existing_backend)
+        else:
+            get_logger().info("No existing backend found - creating fallback")
+            self._robust_backend = FallbackBackend()
+
+    def robust_all_gather(self, data, step_info=None):
+        """
+        Public method for robust distributed gathering.
+        This is the main method to call from training loops.
+        """
+        
+        if not self._robust_backend:
+            return {"single_node": data}
+        
+        # Handle step info
+        if isinstance(step_info, dict):
+            step_num = step_info.get('step', self._step_counter)
+        elif isinstance(step_info, int):
+            step_num = step_info
+        else:
+            step_num = self._step_counter
+            
+        self._step_counter = max(self._step_counter, step_num) + 1
+        
+        try:
+            # Try safe_all_gather first (emergency wrapper)
+            if hasattr(self._robust_backend, 'safe_all_gather'):
+                result = self._robust_backend.safe_all_gather(data)
+                
+                # Log communication status periodically
+                if step_num % 1000 == 0 and step_num > 0:
+                    self._log_communication_status(step_num, result)
+                
+                # Reset error count on successful distributed gather
+                if len(result) > 1 and self._communication_errors > 0:
+                    get_logger().info(f"Communication recovered at step {step_num} - back to distributed mode")
+                    self._communication_errors = 0
+                    self._last_successful_gather = step_num
+                elif len(result) > 1:
+                    self._last_successful_gather = step_num
+                
+                return result
+                
+            # Fallback to direct backend
+            elif hasattr(self._robust_backend, 'all_gather_object'):
+                return self._robust_backend.all_gather_object(data)
+                
+            else:
+                get_logger().debug(f"No communication method available at step {step_num}")
+                return {self._robust_backend.get_id(): data}
+                
+        except Exception as e:
+            return self._handle_communication_error(e, data, step_num)
+
+    def _handle_communication_error(self, error, data, step_num):
+        """Handle communication errors gracefully"""
+        
+        self._communication_errors += 1
+        error_msg = str(error)
+        
+        # Log error but don't spam logs
+        if self._communication_errors <= 5 or self._communication_errors % 100 == 0:
+            get_logger().error(f"Step {step_num}: Communication failed ({self._communication_errors}): {error_msg}")
+        
+        # Check for critical communication errors
+        critical_patterns = [
+            "ran out of input", "pipe", "connection", "dht", "hivemind", 
+            "eof", "resource temporarily unavailable", "blocking"
+        ]
+        
+        if any(pattern in error_msg.lower() for pattern in critical_patterns):
+            if self._communication_errors <= 3:  # Only log first few times
+                get_logger().warning(f"Critical communication error detected at step {step_num}")
+            self._enable_emergency_mode()
+        
+        # Ultimate fallback - single node processing
+        agent_id = getattr(self._robust_backend, 'get_id', lambda: f"emergency_{os.getpid()}")()
+        return {agent_id: data}
+
+    def _enable_emergency_mode(self):
+        """Enable emergency mode to prevent further communication failures"""
+        
+        if not self._emergency_mode_enabled:
+            self._emergency_mode_enabled = True
+            get_logger().warning("EMERGENCY MODE ENABLED - switching to single-node training")
+            
+            # Try to enable emergency mode in backend
+            if hasattr(self._robust_backend, 'backend'):
+                if hasattr(self._robust_backend.backend, '_emergency_mode'):
+                    self._robust_backend.backend._emergency_mode = True
+            
+            # Set environment flag for immediate effect
+            emergency_disable_dht()
+
+    def _log_communication_status(self, step_num, gathered_results):
+        """Log communication status"""
+        
+        # Get backend status if available
+        mode = getattr(self._robust_backend, 'get_training_mode', lambda: 'unknown')()
+        
+        get_logger().info(f"Step {step_num} Communication Status:")
+        get_logger().info(f"  Agents: {len(gathered_results)}")
+        get_logger().info(f"  Mode: {mode}")
+        get_logger().info(f"  Emergency: {self._emergency_mode_enabled}")
+        get_logger().info(f"  Total errors: {self._communication_errors}")
+        get_logger().info(f"  Last distributed: {self._last_successful_gather}")
+
+    def train_step_with_communication(self, batch_data, step_num, loss_fn=None, optimizer=None):
+        """
+        Enhanced training step with built-in communication.
+        This method can be called directly from training loops.
+        """
+        
+        try:
+            # Forward pass (using existing GRPO logic)
+            with torch.cuda.amp.autocast():
+                outputs = self.forward(batch_data)
+                loss = outputs.get('loss', None)
+                
+                if loss is None and loss_fn is not None:
+                    loss = loss_fn(outputs, batch_data)
+            
+            # Prepare data for distributed gathering
+            step_data = {
+                'step': step_num,
+                'loss': loss.item() if loss is not None else 0.0,
+                'agent_id': self._robust_backend.get_id(),
+                'batch_size': len(batch_data) if hasattr(batch_data, '__len__') else 1,
+                'timestamp': time.time()
+            }
+            
+            # Add model-specific outputs if available
+            if 'logits' in outputs:
+                step_data['has_logits'] = True
+            if 'rewards' in outputs:
+                step_data['avg_reward'] = torch.mean(outputs['rewards']).item()
+            
+            # DISTRIBUTED GATHERING
+            gathered_results = self.robust_all_gather(step_data, step_num)
+            
+            # Process distributed results
+            processed_outputs = self._process_distributed_results(gathered_results, outputs, step_num)
+            
+            # Backward pass
+            if loss is not None:
+                loss.backward()
+                
+                # Gradient clipping
+                if hasattr(self, 'model'):
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                
+                # Optimizer step
+                if optimizer is not None:
+                    optimizer.step()
+                    optimizer.zero_grad()
+            
+            # Clear cache periodically
+            if step_num % 10 == 0:
+                self._smart_cache_clear()
+            
+            return processed_outputs
+            
+        except Exception as e:
+            get_logger().error(f"Training step {step_num} failed: {e}")
+            # Return minimal output to continue training
+            return {
+                'loss': torch.tensor(0.0),
+                'step': step_num,
+                'error': str(e),
+                'gathered_results': {self._robust_backend.get_id(): step_data} if 'step_data' in locals() else {}
+            }
+
+    def _process_distributed_results(self, gathered_results, original_outputs, step_num):
+        """Process results from distributed gathering"""
+        
+        processed = original_outputs.copy() if isinstance(original_outputs, dict) else {}
+        processed['step'] = step_num
+        processed['num_agents'] = len(gathered_results)
+        processed['gathered_results'] = gathered_results
+        
+        if len(gathered_results) == 1:
+            # Single-node mode
+            processed['training_mode'] = 'single_node'
+            if step_num % 500 == 0:
+                get_logger().info(f"Step {step_num}: Single-node training")
+                
+        else:
+            # Multi-agent mode
+            processed['training_mode'] = 'distributed'
+            
+            # Aggregate metrics from all agents
+            losses = []
+            batch_sizes = []
+            
+            for agent_id, data in gathered_results.items():
+                if isinstance(data, dict):
+                    if 'loss' in data and isinstance(data['loss'], (int, float)):
+                        losses.append(data['loss'])
+                    if 'batch_size' in data:
+                        batch_sizes.append(data['batch_size'])
+            
+            if losses:
+                processed['distributed_avg_loss'] = sum(losses) / len(losses)
+                processed['distributed_loss_std'] = torch.std(torch.tensor(losses)).item()
+            
+            if batch_sizes:
+                processed['total_batch_size'] = sum(batch_sizes)
+            
+            # Log distributed training info
+            if step_num % 100 == 0:
+                avg_loss = processed.get('distributed_avg_loss', 0.0)
+                get_logger().info(f"Step {step_num}: Distributed training - {len(gathered_results)} agents, avg_loss = {avg_loss:.4f}")
+        
+        return processed
+
+    # INTEGRATION WITH EXISTING FRAMEWORK
+    def all_gather_object(self, obj):
+        """Override parent's all_gather_object with robust version"""
+        return self.robust_all_gather(obj, self._step_counter)
+
+    def set_communication_backend(self, backend):
+        """Allow external setting of communication backend"""
+        if backend is not None:
+            self._robust_backend = create_robust_communication_wrapper(backend)
+            get_logger().info("Communication backend updated with robust wrapper")
+
+    # ORIGINAL METHODS (unchanged interface)
     
-    # Check multiprocessing method
-    try:
-        method = mp.get_start_method()
-        if method != 'spawn':
-            issues.append(f"Multiprocessing method is '{method}', recommend 'spawn' for stability")
-    except:
-        issues.append("Could not determine multiprocessing method")
+    def _is_model_quantized(self, model) -> bool:
+        """Check if model is quantized"""
+        # Check BnB attributes
+        if hasattr(model, 'is_quantized') and model.is_quantized:
+            return True
+        if hasattr(model, 'is_loaded_in_4bit') and model.is_loaded_in_4bit:
+            return True
+        
+        # Check quantization config
+        if (hasattr(model, 'config') and 
+            hasattr(model.config, 'quantization_config') and 
+            model.config.quantization_config is not None):
+            qconfig = model.config.quantization_config
+            if hasattr(qconfig, 'load_in_4bit') and qconfig.load_in_4bit:
+                return True
+        
+        # Check parameter dtypes (quantized models have int/uint params)
+        int_params = 0
+        total_params = 0
+        for param in model.parameters():
+            total_params += param.numel()
+            if 'int' in str(param.dtype).lower():
+                int_params += param.numel()
+        
+        return total_params > 0 and int_params / total_params > 0.1
+
+    def _reload_with_quantization(self, model, kwargs):
+        """Reload model with 4-bit quantization"""
+        model_name = getattr(model, 'name_or_path', kwargs.get("model_id", "Qwen/Qwen2.5-3B-Instruct"))
+        
+        # Clear GPU memory
+        if hasattr(model, 'cpu'):
+            model.cpu()
+        del model
+        gc.collect()
+        torch.cuda.empty_cache()
+        
+        # Create quantization config
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_compute_dtype=torch.bfloat16
+        )
+        
+        # Reload with quantization
+        new_model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            quantization_config=bnb_config,
+            device_map="auto",
+            torch_dtype=torch.bfloat16
+        )
+        
+        return new_model
+
+    def _smart_cache_clear(self):
+        """Clear cache only when memory usage is high"""
+        if torch.cuda.is_available():
+            allocated_gb = torch.cuda.memory_allocated() / 1024**3
+            if allocated_gb > 3.5:
+                torch.cuda.empty_cache()
+
+    def _initialize_model(self, enable_gradient_checkpointing: bool = False):
+        """
+        Override to handle quantized models properly.
+        """
+        is_quantized = self._is_model_quantized(self.model)
+        
+        if is_quantized:
+            pass  # For quantized models, don't cast dtype
+        else:
+            self.model = self.model.to(device=self.device, dtype=self.dtype)
+        
+        if enable_gradient_checkpointing and hasattr(self.model, 'gradient_checkpointing_enable'):
+            self.model.gradient_checkpointing_enable()
+
+    @torch.no_grad()
+    def evaluate(self, state: GameState, data_manager: DataManager, reward_manager: RewardManager):
+        """Original evaluate method unchanged"""
+        if not self.judge_client:
+            return
+            
+        try:
+            model_name = self.model.name_or_path
+        except AttributeError:
+            model_name = "none"
+
+        result = self.judge_client.request_question(
+            user_id=state.peer_id,
+            round_number=state.round,
+            model_name=model_name
+        )
+        
+        if not result:
+            return
+
+        prompt = [
+            {"role": "system", "content": SYSTEM_PROMPTS["default"]},
+            {"role": "user", "content": result["question"]},
+        ]
+        input_ids = self.processing_class.apply_chat_template(
+            prompt,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_tensors="pt",
+        )
+
+        input_ids = input_ids.to(self.model.device)
+        outputs = self.model.generate(input_ids, max_new_tokens=512)
+        answer = self.processing_class.decode(outputs[0], skip_special_tokens=True)
+        
+        self._smart_cache_clear()
+        
+        self.judge_client.submit_answer(
+            session_id=result["session_id"],
+            round_number=state.round,
+            user_answer=answer
+        )
+
+    @torch.no_grad()
+    def play_prg_game_logits(self, prg_history_dict: dict) -> dict:
+        """Original PRG game method unchanged"""
+        if not self.judge_client:
+            return {'status': PRGGameStatus.ERROR}
+
+        game_clue_dict = self.judge_client.get_current_clue()
+        
+        if not isinstance(game_clue_dict, dict):
+            return {'status': PRGGameStatus.ERROR}
+        
+        game_id = game_clue_dict.get("game_id", -1)
+        clue_id = game_clue_dict.get("clue_id", -1)
+        rounds_remaining = game_clue_dict.get("rounds_remaining", -1)
+        clue = game_clue_dict.get("clue") or ""
+        choices = game_clue_dict.get("choices") or []
+        
+        if any(val < 0 for val in (game_id, clue_id, rounds_remaining)):
+            return {'status': PRGGameStatus.NO_ACTIVE_GAME}
+        if game_id in prg_history_dict and clue_id <= prg_history_dict[game_id]:
+            return {'status': PRGGameStatus.ALREADY_ANSWERED}
+        if not clue or not isinstance(choices, list) or not choices:
+            return {'status': PRGGameStatus.ERROR}
+
+        try:
+            choices_str = ", ".join(choices)
+            custom_prompt = f"{clue}\nPossible Answers: {choices_str}\nAnswer:"
+            
+            prompt = [
+                {"role": "system", "content": PRG_SYSTEM_PROMPT_NO_THINKING},
+                {"role": "user", "content": custom_prompt},
+            ]
+            input_ids = self.processing_class.apply_chat_template(
+                prompt,
+                tokenize=True,
+                add_generation_prompt=True,
+                return_tensors="pt",
+            )
+
+            input_ids = input_ids.to(self.model.device)
+            choice_logits = self._get_choice_logits(input_ids, choices)
+            choice_idx = torch.argmax(choice_logits).item()
+            
+            torch.cuda.empty_cache()
+            
+            return {
+                "game_idx": game_id,
+                "clue_idx": clue_id,
+                "choice_idx": choice_idx,
+                "choice": choices[choice_idx],
+                "rounds_remaining": rounds_remaining,
+                "status": PRGGameStatus.SUCCESS
+            }
+
+        except Exception as e:
+            get_logger().info(f"Error while computing logits for choices: {e}")
+            return {'status': PRGGameStatus.ERROR}
+
+    def _get_choice_logits(self, input_ids: torch.Tensor, choices: List[str]) -> torch.Tensor:
+        """Original choice logits method unchanged"""
+        device = input_ids.device
+        batch_size, prompt_len = input_ids.shape
+        logits_list = []
+
+        for choice in choices:
+            answer_str = f"<answer>{choice}</answer>"
+            choice_ids = self.processing_class(
+                answer_str,
+                return_tensors="pt",
+                add_special_tokens=False
+            ).input_ids.to(device)
+
+            seq = torch.cat([input_ids, choice_ids], dim=1)
+            labels = seq.clone()
+            labels[:, :prompt_len] = -100
+            outputs = self.model(input_ids=seq, labels=labels)
+
+            total_log_prob = -outputs.loss * choice_ids.size(1)
+            logits_list.append(total_log_prob)
+
+        return torch.stack(logits_list)
+
+    def cleanup(self):
+        """Clean shutdown of communication backend"""
+        
+        if self._robust_backend:
+            try:
+                if hasattr(self._robust_backend, 'backend'):
+                    if hasattr(self._robust_backend.backend, 'shutdown'):
+                        self._robust_backend.backend.shutdown()
+                elif hasattr(self._robust_backend, 'shutdown'):
+                    self._robust_backend.shutdown()
+                    
+            except Exception as e:
+                get_logger().warning(f"Communication cleanup error: {e}")
+
+    def __del__(self):
+        """Ensure cleanup on deletion"""
+        try:
+            self.cleanup()
+        except:
+            pass
+
+
+# Simple usage example
+def example_usage():
+    """Example showing how to use the enhanced trainer"""
     
-    # Check file descriptor limits
-    try:
-        import resource
-        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-        if soft < 1024:
-            issues.append(f"Low file descriptor limit: {soft}, recommend >= 1024")
-    except:
-        pass
+    # Initialize trainer (same as before)
+    trainer = GRPOTrainerModule([], model_id="Qwen/Qwen2.5-3B-Instruct")
     
-    # Check available memory
-    try:
-        import psutil
-        memory = psutil.virtual_memory()
-        if memory.available < 1024 * 1024 * 1024:  # 1GB
-            issues.append(f"Low available memory: {memory.available / 1024**3:.1f}GB")
-    except:
-        pass
+    # Training loop with robust communication
+    for step in range(100):
+        try:
+            # Mock batch data
+            batch_data = {'input_ids': torch.randint(0, 1000, (2, 10))}
+            
+            # OPTION 1: Enhanced training step (recommended)
+            outputs = trainer.train_step_with_communication(batch_data, step)
+            
+            # OPTION 2: Manual gathering 
+            # outputs = trainer(batch_data)
+            # gathered = trainer.robust_all_gather({'loss': outputs['loss'].item()}, step)
+            
+            if step % 20 == 0:
+                mode = outputs.get('training_mode', 'unknown')
+                agents = outputs.get('num_agents', 1)
+                get_logger().info(f"Step {step}: {mode} mode with {agents} agents")
+                
+        except Exception as e:
+            get_logger().error(f"Step {step} failed: {e}")
+            continue
     
-    if issues:
-        get_logger().warning("System health issues detected:")
-        for issue in issues:
-            get_logger().warning(f"  - {issue}")
-    else:
-        get_logger().info("System health check passed")
-    
-    return len(issues) == 0
+    # Cleanup
+    trainer.cleanup()
+    get_logger().info("Training completed successfully")
+
+
+if __name__ == "__main__":
+    example_usage()
