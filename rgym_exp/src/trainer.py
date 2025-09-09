@@ -67,6 +67,19 @@ class EmergencyTrainingWrapper:
             # Always return single-node result to continue training
             return {self.backend.get_id(): obj}
 
+    def all_gather_object(self, obj):
+        """Direct wrapper around safe_all_gather"""
+        return self.safe_all_gather(obj)
+
+    def get_id(self):
+        """Get ID from backend"""
+        return self.backend.get_id()
+
+    def shutdown(self):
+        """Shutdown backend"""
+        if hasattr(self.backend, 'shutdown'):
+            self.backend.shutdown()
+
 
 class FallbackBackend:
     """Simple fallback backend for single-node operation"""
@@ -189,26 +202,26 @@ class GRPOTrainerModule(GRPOLanguageTrainerModule, LoggerMixin):
     def _init_robust_communication(self, kwargs):
         """Initialize robust communication backend"""
         
-        # Check if we're in a distributed environment
+        # Always initialize a robust backend - even in single-node
+        existing_backend = None
+        
+        # Try to get communication backend from parent or kwargs
+        if hasattr(self, 'communication'):
+            existing_backend = self.communication
+        elif 'communication' in kwargs:
+            existing_backend = kwargs['communication']
+        
+        # Check world size to determine if we expect distributed training
         world_size = int(os.environ.get("HIVEMIND_WORLD_SIZE", 1))
-        is_distributed = world_size > 1
-        
-        if not is_distributed:
-            get_logger().info("Single-node environment detected - using fallback backend")
-            self._robust_backend = FallbackBackend()
-            return
-        
-        # Check for existing communication backend in parent
-        existing_backend = getattr(self, 'communication', None)
-        if existing_backend is None:
-            # Try to get from args/kwargs
-            existing_backend = kwargs.get('communication', None)
         
         if existing_backend is not None:
-            get_logger().info("Using existing communication backend with robust wrapper")
+            get_logger().info(f"Found existing communication backend, wrapping with robust features")
             self._robust_backend = create_robust_communication_wrapper(existing_backend)
+        elif world_size > 1:
+            get_logger().info(f"Distributed environment detected (world_size={world_size}) but no backend found - using fallback")
+            self._robust_backend = FallbackBackend()
         else:
-            get_logger().info("No existing backend found - creating fallback")
+            get_logger().info("Single-node environment - using fallback backend")
             self._robust_backend = FallbackBackend()
 
     def robust_all_gather(self, data, step_info=None):
@@ -372,7 +385,7 @@ class GRPOTrainerModule(GRPOLanguageTrainerModule, LoggerMixin):
             get_logger().error(f"Training step {step_num} failed: {e}")
             # Return minimal output to continue training
             return {
-                'loss': torch.tensor(0.0),
+                'loss': torch.tensor(0.0) if 'loss' not in locals() else loss,
                 'step': step_num,
                 'error': str(e),
                 'gathered_results': {self._robust_backend.get_id(): step_data} if 'step_data' in locals() else {}
@@ -421,16 +434,45 @@ class GRPOTrainerModule(GRPOLanguageTrainerModule, LoggerMixin):
         
         return processed
 
-    # INTEGRATION WITH EXISTING FRAMEWORK
+    # CRITICAL: Override all communication methods to prevent training stoppage
     def all_gather_object(self, obj):
         """Override parent's all_gather_object with robust version"""
-        return self.robust_all_gather(obj, self._step_counter)
+        try:
+            return self.robust_all_gather(obj, self._step_counter)
+        except Exception as e:
+            get_logger().error(f"all_gather_object failed: {e}")
+            # Always return single-node result to prevent training stoppage
+            return {self.get_id(): obj}
+
+    def get_id(self):
+        """Get agent ID - always returns valid ID"""
+        try:
+            if self._robust_backend:
+                return self._robust_backend.get_id()
+        except Exception as e:
+            get_logger().warning(f"Failed to get ID from backend: {e}")
+        
+        # Fallback ID
+        return f"trainer_{os.getpid()}"
 
     def set_communication_backend(self, backend):
         """Allow external setting of communication backend"""
         if backend is not None:
             self._robust_backend = create_robust_communication_wrapper(backend)
             get_logger().info("Communication backend updated with robust wrapper")
+
+    # FRAMEWORK INTEGRATION: Override any communication-related methods
+    def gather(self, *args, **kwargs):
+        """Override any gather methods"""
+        return self.all_gather_object(*args, **kwargs)
+
+    def broadcast(self, obj, *args, **kwargs):
+        """Override broadcast methods"""
+        return self.all_gather_object(obj)
+
+    def communicate(self, obj, *args, **kwargs):
+        """Override generic communicate methods"""
+        return self.all_gather_object(obj)
 
     # ORIGINAL METHODS (unchanged interface)
     
