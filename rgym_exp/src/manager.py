@@ -80,7 +80,13 @@ class CrashSafeSwarmGameManager(BaseGameManager, DefaultGameManagerMixin):
             role_manager=role_manager,
             run_mode=run_mode,
         )
-
+        # STORE CRASH PROTECTION PARAMETERS AS INSTANCE ATTRIBUTES
+        self.memory_threshold_mb = memory_threshold_mb
+        self.restart_interval_minutes = restart_interval_minutes
+        self.max_auto_restarts = max_auto_restarts
+        self.enable_crash_protection = enable_crash_protection
+        self.health_check_interval = health_check_interval
+        
         assert isinstance(self.communication, HivemindBackend)
         self.train_timeout = 60 * 60 * 24 * 31  # 1 month
 
@@ -93,9 +99,23 @@ class CrashSafeSwarmGameManager(BaseGameManager, DefaultGameManagerMixin):
             # Initialize training state manager
             self.training_state_manager = TrainingStateManager()
             
+            # DEBUG: Log parameter types being passed to backend
+            get_logger().debug(f"Manager crash protection params:")
+            get_logger().debug(f"  memory_threshold_mb: {type(self.memory_threshold_mb)} = {self.memory_threshold_mb}")
+            get_logger().debug(f"  restart_interval_minutes: {type(self.restart_interval_minutes)} = {self.restart_interval_minutes}")
+            get_logger().debug(f"  max_auto_restarts: {type(self.max_auto_restarts)} = {self.max_auto_restarts}")
+            
             # Register with DHT backend for coordination
             self.communication.register_training_state_manager(self.training_state_manager)
             self.communication.set_restart_callback(self._on_dht_restart_event)
+            
+            # POTENTIAL FIX: Ensure backend has correct types
+            if hasattr(self.communication, 'memory_threshold_mb'):
+                self.communication.memory_threshold_mb = float(self.memory_threshold_mb)
+            if hasattr(self.communication, 'restart_interval_minutes'):
+                self.communication.restart_interval_minutes = float(self.restart_interval_minutes)
+            if hasattr(self.communication, 'max_auto_restarts'):
+                self.communication.max_auto_restarts = int(self.max_auto_restarts)
             
             get_logger().info("🛡️ Crash protection enabled")
             get_logger().info(f"🔄 DHT auto-restart: {self.communication.auto_restart_enabled}")
