@@ -111,7 +111,7 @@ game_manager:
     initial_peers: ${communications.initial_peers}
     identity_path: ${oc.env:IDENTITY_PATH,null}
     startup_timeout: 120
-    dht_timeout_minutes: 260
+    dht_timeout_minutes: 3610
     beam_size: 15
     disable_caching: true
     cache_locally: false
@@ -123,7 +123,6 @@ game_manager:
     enable_robust_mode: true
     health_check_interval: 60
     max_pipe_errors: 5
-    enable_emergency_wrapper: true
   coordinator:
     _target_: rgym_exp.src.coordinator.ModalSwarmCoordinator
     web3_url: ${blockchain.alchemy_url}
