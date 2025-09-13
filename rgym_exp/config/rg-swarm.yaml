@@ -53,9 +53,9 @@ game_manager:
   prg_game_config: ${prg_game_config}
   enable_crash_protection: true
   enable_dht_auto_restart: true
-  memory_threshold_mb: ${oc.env:MEMORY_THRESHOLD_MB,10000}
-  restart_interval_minutes: ${oc.env:RESTART_INTERVAL_MIN,60}
-  max_auto_restarts: ${oc.env:MAX_AUTO_RESTARTS,150}
+  memory_threshold_mb: 10000
+  restart_interval_minutes: 60
+  max_auto_restarts: 150
   health_check_interval: 60
   game_state: 
     _target_: genrl.state.game_state.GameState
@@ -117,9 +117,9 @@ game_manager:
     cache_locally: false
     cache_on_store: false
     auto_restart_enabled: ${oc.env:AUTO_RESTART_ENABLED,true}
-    memory_threshold_mb: ${oc.env:MEMORY_THRESHOLD_MB,10000}
-    restart_interval_minutes: ${oc.env:RESTART_INTERVAL_MIN,60}
-    max_auto_restarts: ${oc.env:MAX_AUTO_RESTARTS,150}
+    memory_threshold_mb: 10000
+    restart_interval_minutes: 60
+    max_auto_restarts: 150
     enable_robust_mode: true
     health_check_interval: 60
     max_pipe_errors: 5
