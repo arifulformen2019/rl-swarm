@@ -115,6 +115,7 @@ game_manager:
     startup_timeout: 120
     dht_timeout_minutes: 3610
     beam_size: 15
+    world_size: 6
     disable_caching: true
     cache_locally: false
     cache_on_store: false
