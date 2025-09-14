@@ -117,12 +117,13 @@ game_manager:
     cache_locally: false
     cache_on_store: false
     auto_restart_enabled: ${oc.env:AUTO_RESTART_ENABLED,true}
-    memory_threshold_mb: 10000
+    memory_threshold_mb: 12000
     restart_interval_minutes: 60
-    max_auto_restarts: 150
+    max_auto_restarts: 200
     enable_robust_mode: true
     health_check_interval: 60
     max_pipe_errors: 5
+    world_size: 12
   coordinator:
     _target_: rgym_exp.src.coordinator.ModalSwarmCoordinator
     web3_url: ${blockchain.alchemy_url}
