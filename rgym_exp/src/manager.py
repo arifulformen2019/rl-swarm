@@ -41,147 +41,8 @@ except ImportError:
     Back = MockBack()
 
 
-class BeautifulLogger:
-    """Enhanced logger with beautiful formatting and emoji support"""
-    
-    EMOJIS = {
-        'start': '🚀',
-        'success': '✅', 
-        'error': '❌',
-        'warning': '⚠️',
-        'info': 'ℹ️',
-        'rocket': '🚀',
-        'fire': '🔥',
-        'crown': '👑',
-        'gem': '💎',
-        'lightning': '⚡',
-        'shield': '🛡️',
-        'brain': '🧠',
-        'robot': '🤖',
-        'chart': '📊',
-        'trophy': '🏆',
-        'gear': '⚙️',
-        'sync': '🔄',
-        'heart': '💓',
-        'star': '⭐',
-        'celebration': '🎉',
-        'hourglass': '⏳',
-        'clock': '🕐',
-        'save': '💾',
-        'upload': '📤',
-        'download': '📥',
-        'network': '🌐',
-        'chain': '⛓️',
-    }
-    
-    @classmethod
-    def create_box_message(cls, title: str, content: list, width: int = 70, emoji: str = ''):
-        """Create beautiful box-style message"""
-        if not COLORAMA_AVAILABLE:
-            result = f"\n=== {title} ===\n"
-            for line in content:
-                result += f"  {line}\n"
-            result += "=" * (len(title) + 8) + "\n"
-            return result
-            
-        # Header
-        header = f"{emoji} {title}" if emoji else title
-        
-        lines = [
-            f"{Fore.CYAN}{'═' * width}",
-            f"{Fore.CYAN}║{Style.BRIGHT}{Fore.WHITE} {header:<{width-4}} {Fore.CYAN}║",
-            f"{Fore.CYAN}╠{'═' * (width-2)}╣"
-        ]
-        
-        # Content lines
-        for line in content:
-            if len(line) > width - 6:
-                # Word wrap for long lines
-                words = line.split()
-                current_line = ""
-                for word in words:
-                    if len(current_line + word) > width - 8:
-                        lines.append(f"{Fore.CYAN}║ {Fore.WHITE}{current_line:<{width-4}} {Fore.CYAN}║")
-                        current_line = word + " "
-                    else:
-                        current_line += word + " "
-                if current_line.strip():
-                    lines.append(f"{Fore.CYAN}║ {Fore.WHITE}{current_line.strip():<{width-4}} {Fore.CYAN}║")
-            else:
-                lines.append(f"{Fore.CYAN}║ {Fore.WHITE}{line:<{width-4}} {Fore.CYAN}║")
-        
-        # Footer
-        lines.append(f"{Fore.CYAN}{'═' * width}{Style.RESET_ALL}")
-        
-        for line in lines:
-            print(line)
-        
-        return ""
-    
-    @classmethod
-    def status_line(cls, label: str, value: str, status: str = "info", width: int = 50):
-        """Create beautiful status line"""
-        if not COLORAMA_AVAILABLE:
-            return f"{label}: {value}"
-        
-        colors = {
-            "success": Fore.LIGHTGREEN_EX,
-            "error": Fore.LIGHTRED_EX,
-            "warning": Fore.YELLOW,
-            "info": Fore.LIGHTBLUE_EX,
-            "neutral": Fore.WHITE
-        }
-        
-        emoji = {
-            "success": cls.EMOJIS['success'],
-            "error": cls.EMOJIS['error'], 
-            "warning": cls.EMOJIS['warning'],
-            "info": cls.EMOJIS['info'],
-            "neutral": ""
-        }
-        
-        color = colors.get(status, Fore.WHITE)
-        icon = emoji.get(status, "")
-        
-        # Format: [ICON] Label: Value
-        formatted = f"{icon} {Style.BRIGHT}{label}:{Style.RESET_ALL} {color}{value}{Style.RESET_ALL}"
-        return formatted
-    
-    @classmethod
-    def progress_bar(cls, current: int, total: int, width: int = 30, label: str = ""):
-        """Create beautiful progress bar"""
-        if not COLORAMA_AVAILABLE:
-            return f"{label} {current}/{total}"
-            
-        percentage = (current / total) if total > 0 else 0
-        filled = int(width * percentage)
-        
-        bar = (f"{Back.GREEN}{' ' * filled}"
-               f"{Back.WHITE}{' ' * (width - filled)}"
-               f"{Style.RESET_ALL}")
-        
-        return f"{label} {bar} {percentage:.1%} ({current}/{total})"
-    
-    @classmethod
-    def section_header(cls, title: str, emoji: str = "", level: int = 1):
-        """Create beautiful section header"""
-        if not COLORAMA_AVAILABLE:
-            return f"=== {title} ==="
-            
-        symbols = ["═", "─", "·"]
-        symbol = symbols[min(level-1, len(symbols)-1)]
-        
-        header_emoji = emoji if emoji else cls.EMOJIS.get('star', '')
-        full_title = f"{header_emoji} {title}"
-        
-        width = max(60, len(full_title) + 10)
-        line = symbol * width
-        
-        return f"\n{Fore.MAGENTA}{Style.BRIGHT}{line}\n{full_title:^{width}}\n{line}{Style.RESET_ALL}\n"
-
-
 class CrashSafeSwarmGameManager(BaseGameManager, DefaultGameManagerMixin):
-    """Enhanced SwarmGameManager with crash protection and beautiful logging."""
+    """Enhanced SwarmGameManager with crash protection and clean logging."""
 
     def __init__(
         self,
@@ -216,9 +77,6 @@ class CrashSafeSwarmGameManager(BaseGameManager, DefaultGameManagerMixin):
         self._last_health_log_time = 0
         self.coordinator = coordinator
         
-        # Initialize beautiful logger
-        self.logger = BeautifulLogger()
-        
         # Call parent constructor
         super().__init__(
             max_stage=max_stage,
@@ -240,9 +98,7 @@ class CrashSafeSwarmGameManager(BaseGameManager, DefaultGameManagerMixin):
             self._init_crash_protection()
         else:
             self.training_state_manager = None
-            get_logger().warning(self.logger.status_line(
-                "Crash Protection", "DISABLED", "warning"
-            ))
+            get_logger().warning(f"{Fore.YELLOW}⚠️ [SWARM MANAGER] Crash Protection: DISABLED{Style.RESET_ALL}")
 
         # Setup peer identity and model info
         self.peer_id = self.communication.get_id()
@@ -266,7 +122,7 @@ class CrashSafeSwarmGameManager(BaseGameManager, DefaultGameManagerMixin):
         self._log_initialization_status()
 
     def _init_crash_protection(self):
-        """Initialize crash protection system with beautiful logging"""
+        """Initialize crash protection system with clean logging"""
         self.training_state_manager = TrainingStateManager()
         
         # Register with DHT backend
@@ -281,9 +137,7 @@ class CrashSafeSwarmGameManager(BaseGameManager, DefaultGameManagerMixin):
         if hasattr(self.communication, 'max_auto_restarts'):
             self.communication.max_auto_restarts = self.max_auto_restarts
             
-        get_logger().info(self.logger.status_line(
-            "Crash Protection", "INITIALIZED", "success"
-        ))
+        get_logger().info(f"{Fore.GREEN}✅ [SWARM MANAGER] Crash Protection: INITIALIZED{Style.RESET_ALL}")
 
     def _get_model_name(self) -> str:
         """Get model name from trainer"""
@@ -307,8 +161,8 @@ class CrashSafeSwarmGameManager(BaseGameManager, DefaultGameManagerMixin):
         return clean_name
 
     def _setup_logging(self, log_dir: str, model_name: str):
-        """Setup beautiful logging configuration"""
-        # Enhanced format with colors and emoji
+        """Setup clean logging configuration"""
+        # Enhanced format with colors
         if COLORAMA_AVAILABLE:
             format_msg = f"{Fore.CYAN}[{Style.BRIGHT}{{model}}{Style.RESET_ALL}{Fore.CYAN}] {Fore.WHITE}%(asctime)s {Fore.YELLOW}%(levelname)s{Fore.WHITE}: %(message)s{Style.RESET_ALL}"
         else:
@@ -321,17 +175,8 @@ class CrashSafeSwarmGameManager(BaseGameManager, DefaultGameManagerMixin):
         class ColoredFormatter(logging.Formatter):
             def format(self, record):
                 if COLORAMA_AVAILABLE:
-                    # Color by log level
-                    level_colors = {
-                        'DEBUG': Fore.BLUE,
-                        'INFO': Fore.WHITE,
-                        'WARNING': Fore.YELLOW,
-                        'ERROR': Fore.RED,
-                        'CRITICAL': Fore.MAGENTA + Style.BRIGHT
-                    }
-                    
                     original_format = self._style._fmt
-                    # Sử dụng biến từ closure thay vì self.model_display_name
+                    # Use variable from closure instead of self.model_display_name
                     self._style._fmt = original_format.replace('{model}', model_display_name)
                     
                     # Format with colors
@@ -351,16 +196,11 @@ class CrashSafeSwarmGameManager(BaseGameManager, DefaultGameManagerMixin):
         file_handler.setFormatter(formatter)
         get_logger().addHandler(file_handler)
         
-        get_logger().info(self.logger.status_line(
-            "Model Loaded", model_name, "success"
-        ))
-
+        get_logger().info(f"{Fore.GREEN}✅ [SWARM MANAGER] Model Loaded: {model_name}{Style.RESET_ALL}")
 
     def _init_blockchain_components(self):
-        """Initialize blockchain-related components with beautiful logging"""
-        get_logger().info(self.logger.section_header(
-            "Blockchain Initialization", self.logger.EMOJIS['chain'], 2
-        ))
+        """Initialize blockchain-related components with clean logging"""
+        get_logger().info(f"{Fore.CYAN}⛓️ [BLOCKCHAIN] Initializing components...{Style.RESET_ALL}")
         
         self.coordinator.register_peer(self.peer_id)
         
@@ -376,15 +216,11 @@ class CrashSafeSwarmGameManager(BaseGameManager, DefaultGameManagerMixin):
         self.submitted_this_round = False
         self.round_counter = 0
         
-        get_logger().info(self.logger.status_line(
-            "Blockchain Sync", f"Round {round_num}", "success"
-        ))
+        get_logger().info(f"{Fore.GREEN}✅ [BLOCKCHAIN] Synced to round {round_num}{Style.RESET_ALL}")
 
     def _init_training_components(self, log_dir: str, hf_token: str | None, hf_push_frequency: int, **kwargs):
-        """Initialize training-related components with beautiful logging"""
-        get_logger().info(self.logger.section_header(
-            "Training Components Setup", self.logger.EMOJIS['brain'], 2
-        ))
+        """Initialize training-related components with clean logging"""
+        get_logger().info(f"{Fore.CYAN}🧠 [TRAINING] Setting up components...{Style.RESET_ALL}")
         
         # Setup Hugging Face integration
         self.hf_token = hf_token
@@ -395,16 +231,14 @@ class CrashSafeSwarmGameManager(BaseGameManager, DefaultGameManagerMixin):
         self.prg_module = PRGModule(log_dir, **kwargs)
         self.prg_game = self.prg_module.prg_game
         
-        get_logger().info(self.logger.status_line(
-            "PRG Module", "LOADED", "success"
-        ))
+        get_logger().info(f"{Fore.GREEN}✅ [TRAINING] PRG Module loaded{Style.RESET_ALL}")
         
         # Write system info
         with open(os.path.join(log_dir, f"system_info.txt"), "w") as f:
             f.write(get_system_info())
 
     def _setup_huggingface_integration(self):
-        """Setup Hugging Face Hub integration with beautiful logging"""
+        """Setup Hugging Face Hub integration with clean logging"""
         if (self.hf_token not in [None, "None"] and 
             not (hasattr(self.trainer, "use_vllm") and self.trainer.use_vllm)):
             try:
@@ -416,83 +250,61 @@ class CrashSafeSwarmGameManager(BaseGameManager, DefaultGameManagerMixin):
                 self.trainer.args.push_to_hub = True
                 self.trainer.args.hub_token = self.hf_token
                 
-                get_logger().info(self.logger.status_line(
-                    "Hugging Face Hub", f"Connected as {username}", "success"
-                ))
+                get_logger().info(f"{Fore.GREEN}✅ [HUGGING FACE] Connected as {username}{Style.RESET_ALL}")
                 login(self.hf_token)
             except Exception as e:
-                get_logger().warning(self.logger.status_line(
-                    "Hugging Face Setup", f"Failed: {e}", "error"
-                ))
+                get_logger().warning(f"{Fore.YELLOW}⚠️ [HUGGING FACE] Setup failed: {e}{Style.RESET_ALL}")
         else:
-            get_logger().info(self.logger.status_line(
-                "Hugging Face Hub", "DISABLED", "neutral"
-            ))
+            get_logger().info(f"{Fore.WHITE}ℹ️ [HUGGING FACE] Integration disabled{Style.RESET_ALL}")
 
     def _log_initialization_status(self):
-        """Log final initialization status with beautiful design"""
+        """Log final initialization status with clean design"""
         protection_status = "ENABLED" if self.enable_crash_protection else "DISABLED"
-        protection_emoji = self.logger.EMOJIS['shield'] if self.enable_crash_protection else self.logger.EMOJIS['warning']
+        status_emoji = "🚀" if self.enable_crash_protection else "⚠️"
         
-        content = [
-            f"Model: {self.model_display_name}",
-            f"Agent: {self.animal_name} {self.logger.EMOJIS['robot']}",
-            f"Peer ID: {self.peer_id[:16]}...",
-            f"Starting Round: {self.state.round} {self.logger.EMOJIS['rocket']}",
-            f"Crash Protection: {protection_status} {protection_emoji}"
-        ]
-        
-        box_message = self.logger.create_box_message(
-            "SWARM MANAGER INITIALIZED", content, 
-            emoji=self.logger.EMOJIS['celebration']
+        get_logger().info(
+            f"{Fore.GREEN}{status_emoji} [SWARM MANAGER] Initialized successfully:\n"
+            f"   🤖 Model: {self.model_display_name}\n"
+            f"   🐾 Agent: {self.animal_name}\n"
+            f"   📍 Peer ID: {self.peer_id}...\n"
+            f"   🔄 Starting Round: {self.state.round}\n"
+            f"   ⏰ Submit Period: {self.submit_period} hours\n"
+            f"   🎮 PRG Game: {'Enabled' if self.prg_game else 'Disabled'}\n"
+            f"   🛡️ Crash Protection: {protection_status}{Style.RESET_ALL}"
         )
-        
-        get_logger().info(box_message)
 
     def _on_dht_restart_event(self, event_type: str, reason: str):
-        """Handle DHT restart events with beautiful logging"""
+        """Handle DHT restart events with clean logging"""
         if event_type == "restart_completed":
-            get_logger().info(self.logger.status_line(
-                "DHT Restart", f"COMPLETED - {reason}", "success"
-            ))
+            get_logger().info(f"{Fore.GREEN}✅ [DHT RESTART] Completed - {reason}{Style.RESET_ALL}")
         elif event_type == "restart_failed":
-            get_logger().error(self.logger.status_line(
-                "DHT Restart", f"FAILED - {reason}", "error"
-            ))
+            get_logger().error(f"{Fore.RED}❌ [DHT RESTART] Failed - {reason}{Style.RESET_ALL}")
 
     def _execute_pending_restart(self):
-        """Execute pending DHT restart with beautiful logging"""
+        """Execute pending DHT restart with clean logging"""
         if not (self.training_state_manager and self.training_state_manager._restart_requested):
             return
             
         reason = self.training_state_manager._restart_reason
         
-        get_logger().info(self.logger.section_header(
-            f"Executing DHT Restart: {reason}", self.logger.EMOJIS['sync'], 2
-        ))
+        get_logger().info(f"{Fore.YELLOW}🔄 [DHT RESTART] Executing: {reason}{Style.RESET_ALL}")
         
         try:
             if hasattr(self.communication, 'perform_coordinated_restart'):
                 self.communication.perform_coordinated_restart(reason)
                 self.training_state_manager.acknowledge_restart()
                 
-                get_logger().info(self.logger.status_line(
-                    "DHT Restart", "COMPLETED SUCCESSFULLY", "success"
-                ))
+                get_logger().info(f"{Fore.GREEN}✅ [DHT RESTART] Completed successfully{Style.RESET_ALL}")
             else:
-                get_logger().error(self.logger.status_line(
-                    "DHT Restart", "METHOD NOT FOUND", "error"
-                ))
+                get_logger().error(f"{Fore.RED}❌ [DHT RESTART] Method not found{Style.RESET_ALL}")
                 self.training_state_manager.acknowledge_restart()
                 
         except Exception as e:
-            get_logger().error(self.logger.status_line(
-                "DHT Restart", f"EXECUTION FAILED: {e}", "error"
-            ))
+            get_logger().error(f"{Fore.RED}❌ [DHT RESTART] Execution failed: {e}{Style.RESET_ALL}")
             self.training_state_manager.acknowledge_restart()
 
     def _safe_blockchain_submit(self, signal_by_agent):
-        """Thread-safe blockchain submit with beautiful logging"""
+        """Thread-safe blockchain submit with clean logging"""
         if not self.enable_crash_protection or not self.training_state_manager:
             return self._try_submit_to_chain(signal_by_agent)
         
@@ -502,9 +314,7 @@ class CrashSafeSwarmGameManager(BaseGameManager, DefaultGameManagerMixin):
         try:
             return self._try_submit_to_chain(signal_by_agent)
         except Exception as e:
-            get_logger().error(self.logger.status_line(
-                "Blockchain Submit", f"FAILED: {e}", "error"
-            ))
+            get_logger().error(f"{Fore.RED}❌ [BLOCKCHAIN SUBMIT] Failed: {e}{Style.RESET_ALL}")
             raise
         finally:
             # Always exit critical section
@@ -530,20 +340,15 @@ class CrashSafeSwarmGameManager(BaseGameManager, DefaultGameManagerMixin):
         return (my_signal + 1) * (my_signal > 0) + my_signal * (my_signal <= 0)
 
     def _try_submit_to_chain(self, signal_by_agent):
-        """Submit results to blockchain with beautiful logging"""
+        """Submit results to blockchain with clean logging"""
         elapsed_hours = (time.time() - self.time_since_submit) / 3600
         
         if elapsed_hours > self.submit_period:
             try:
-                get_logger().info(self.logger.section_header(
-                    f"Blockchain Submission - Round {self.state.round}", 
-                    self.logger.EMOJIS['chain'], 3
-                ))
+                get_logger().info(f"{Fore.CYAN}⛓️ [BLOCKCHAIN] Submitting round {self.state.round}...{Style.RESET_ALL}")
                 
                 points = int(self.batched_signals)
-                get_logger().info(self.logger.status_line(
-                    "Submitting Points", f"{points} points", "info"
-                ))
+                get_logger().info(f"{Fore.BLUE}📊 [BLOCKCHAIN] Submitting {points} points{Style.RESET_ALL}")
                 
                 # Submit reward and winners
                 self.coordinator.submit_reward(self.state.round, 0, points, self.peer_id)
@@ -551,9 +356,7 @@ class CrashSafeSwarmGameManager(BaseGameManager, DefaultGameManagerMixin):
                 if signal_by_agent:
                     max_agent, max_signal = max(signal_by_agent.items(), key=lambda x: x[1])
                     winner_name = get_name_from_peer_id(max_agent, True)
-                    get_logger().info(self.logger.status_line(
-                        "Round Winner", f"{winner_name} ({max_signal} points) {self.logger.EMOJIS['crown']}", "success"
-                    ))
+                    get_logger().info(f"{Fore.YELLOW}👑 [BLOCKCHAIN] Round winner: {winner_name} ({max_signal} points){Style.RESET_ALL}")
                 else:
                     max_agent, max_signal = self.peer_id, points
                 
@@ -564,14 +367,10 @@ class CrashSafeSwarmGameManager(BaseGameManager, DefaultGameManagerMixin):
                 self.time_since_submit = time.time()
                 self.submitted_this_round = True
                 
-                get_logger().info(self.logger.status_line(
-                    "Blockchain Submission", "SUCCESS", "success"
-                ))
+                get_logger().info(f"{Fore.GREEN}✅ [BLOCKCHAIN] Submission successful{Style.RESET_ALL}")
                 
             except Exception as e:
-                get_logger().error(self.logger.status_line(
-                    "Blockchain Submission", f"FAILED: {e}", "error"
-                ))
+                get_logger().error(f"{Fore.RED}❌ [BLOCKCHAIN] Submission failed: {e}{Style.RESET_ALL}")
                 get_logger().exception("Full blockchain submission error")
         else:
             remaining_minutes = (self.submit_period - elapsed_hours) * 60
@@ -581,13 +380,11 @@ class CrashSafeSwarmGameManager(BaseGameManager, DefaultGameManagerMixin):
                 self._last_waiting_log = 0
             
             if time.time() - self._last_waiting_log > 1200:  # 30 minutes
-                get_logger().info(self.logger.status_line(
-                    "Next Blockchain Submit", f"in {remaining_minutes:.0f} minutes {self.logger.EMOJIS['hourglass']}", "info"
-                ))
+                get_logger().info(f"{Fore.WHITE}⏳ [BLOCKCHAIN] Next submit in {remaining_minutes:.0f} minutes{Style.RESET_ALL}")
                 self._last_waiting_log = time.time()
 
     def _hook_after_rewards_updated(self):
-        """Handle reward updates with beautiful logging"""
+        """Handle reward updates with clean logging"""
         # Set training phase
         if self.training_state_manager:
             self.training_state_manager.set_phase(TrainingPhase.MODEL_UPDATE)
@@ -596,12 +393,10 @@ class CrashSafeSwarmGameManager(BaseGameManager, DefaultGameManagerMixin):
         old_signals = self.batched_signals
         self.batched_signals += self._get_my_rewards(signal_by_agent)
         
-        # Log reward updates with beautiful format
+        # Log reward updates with clean format
         reward_gained = self.batched_signals - old_signals
         if reward_gained > 0:
-            get_logger().info(self.logger.status_line(
-                "Reward Gained", f"+{reward_gained:.1f} points {self.logger.EMOJIS['gem']} (Total: {int(self.batched_signals)})", "success"
-            ))
+            get_logger().info(f"{Fore.GREEN}💎 [REWARDS] Gained +{reward_gained:.1f} points (Total: {int(self.batched_signals)}){Style.RESET_ALL}")
         
         # Submit to blockchain
         self._safe_blockchain_submit(signal_by_agent)
@@ -611,16 +406,17 @@ class CrashSafeSwarmGameManager(BaseGameManager, DefaultGameManagerMixin):
             self.training_state_manager.set_phase(TrainingPhase.IDLE)
 
     def _hook_after_round_advanced(self):
-        """Handle round advancement with beautiful logging"""
+        """Handle round advancement with clean logging"""
         self.round_counter += 1
         
-        get_logger().info(self.logger.section_header(
-            f"NEW ROUND STARTED: {self.state.round}", self.logger.EMOJIS['rocket'], 1
-        ))
-        
-        get_logger().info(self.logger.status_line(
-            "Total Rounds Completed", f"{self.round_counter} rounds {self.logger.EMOJIS['trophy']}", "info"
-        ))
+        # Enhanced new round logging with detailed info and bright colors
+        get_logger().info(
+            f"{Fore.MAGENTA}{Style.BRIGHT}🚀 [ROUND ADVANCED] NEW ROUND STARTED! 🚀\n"
+            f"{Fore.CYAN}   📍 Round: {self.state.round}\n"
+            f"{Fore.GREEN}   🏆 Total Rounds: {self.round_counter}\n"
+            f"{Fore.YELLOW}   💎 Pending Points: {int(self.batched_signals)}\n"
+            f"{Fore.BLUE}   🤖 Agent: {self.animal_name}{Style.RESET_ALL}"
+        )
         
         # Log system health periodically
         self._log_system_health()
@@ -630,22 +426,16 @@ class CrashSafeSwarmGameManager(BaseGameManager, DefaultGameManagerMixin):
             if self.training_state_manager:
                 self.training_state_manager.set_phase(TrainingPhase.PRG_GAME)
             
-            get_logger().info(self.logger.section_header(
-                "PRG Game Logic", self.logger.EMOJIS['brain'], 2
-            ))
+            get_logger().info(f"{Fore.CYAN}🎮 [PRG GAME] Running game logic...{Style.RESET_ALL}")
             
             try:
                 prg_history_dict = self.prg_module.prg_history_dict
                 results_dict = self.trainer.play_prg_game_logits(prg_history_dict)
                 self.prg_module.play_prg_game(results_dict, self.peer_id)
                 
-                get_logger().info(self.logger.status_line(
-                    "PRG Game", "COMPLETED SUCCESSFULLY", "success"
-                ))
+                get_logger().info(f"{Fore.GREEN}✅ [PRG GAME] Completed successfully{Style.RESET_ALL}")
             except Exception as e:
-                get_logger().error(self.logger.status_line(
-                    "PRG Game", f"FAILED: {e}", "error"
-                ))
+                get_logger().error(f"{Fore.RED}❌ [PRG GAME] Failed: {e}{Style.RESET_ALL}")
                 get_logger().exception("PRG Game error details")
             finally:
                 if self.training_state_manager:
@@ -665,10 +455,8 @@ class CrashSafeSwarmGameManager(BaseGameManager, DefaultGameManagerMixin):
         self.agent_block()
 
     def _hook_after_game(self):
-        """Handle game completion with beautiful logging"""
-        get_logger().info(self.logger.section_header(
-            "GAME COMPLETION - Final Cleanup", self.logger.EMOJIS['celebration'], 1
-        ))
+        """Handle game completion with clean logging"""
+        get_logger().info(f"{Fore.MAGENTA}🎉 [GAME COMPLETION] Final cleanup...{Style.RESET_ALL}")
         
         # Log final health status
         if self.enable_crash_protection:
@@ -680,18 +468,14 @@ class CrashSafeSwarmGameManager(BaseGameManager, DefaultGameManagerMixin):
         # Clean shutdown
         if hasattr(self.communication, 'shutdown'):
             self.communication.shutdown()
-            get_logger().info(self.logger.status_line(
-                "System Shutdown", "COMPLETED", "success"
-            ))
+            get_logger().info(f"{Fore.GREEN}✅ [SHUTDOWN] System shutdown completed{Style.RESET_ALL}")
 
     def _save_to_hf(self):
-        """Save model to Hugging Face Hub with beautiful logging"""
+        """Save model to Hugging Face Hub with clean logging"""
         if (self.hf_token not in [None, "None"] and 
             self.state.round % self.hf_push_frequency == 0):
             
-            get_logger().info(self.logger.section_header(
-                f"Hugging Face Upload - Round {self.state.round}", self.logger.EMOJIS['upload'], 3
-            ))
+            get_logger().info(f"{Fore.CYAN}📤 [HUGGING FACE] Uploading model (Round {self.state.round})...{Style.RESET_ALL}")
             
             try:
                 repo_id = getattr(self.trainer.args, 'hub_model_id', None) or Path(self.trainer.args.output_dir).name
@@ -703,17 +487,13 @@ class CrashSafeSwarmGameManager(BaseGameManager, DefaultGameManagerMixin):
                     tags=["rl-swarm", "genrl-swarm", "grpo", "gensyn", f"I am {self.animal_name}"]
                 )
                 
-                get_logger().info(self.logger.status_line(
-                    "Model Upload", f"SUCCESS to {repo_id} {self.logger.EMOJIS['success']}", "success"
-                ))
+                get_logger().info(f"{Fore.GREEN}✅ [HUGGING FACE] Upload successful to {repo_id}{Style.RESET_ALL}")
                 
             except Exception as e:
-                get_logger().error(self.logger.status_line(
-                    "Model Upload", f"FAILED: {e}", "error"
-                ))
+                get_logger().error(f"{Fore.RED}❌ [HUGGING FACE] Upload failed: {e}{Style.RESET_ALL}")
 
     def agent_block(self, check_interval=5.0, log_timeout=10.0, max_check_interval=60.0 * 15):
-        """Enhanced agent blocking with beautiful logging and centralized restart execution"""
+        """Enhanced agent blocking with clean logging and centralized restart execution"""
         
         # Set idle phase - this is the safest time for DHT restarts
         if self.training_state_manager:
@@ -723,13 +503,7 @@ class CrashSafeSwarmGameManager(BaseGameManager, DefaultGameManagerMixin):
         fetch_log_time = start_time
         check_backoff = check_interval
         
-        get_logger().info(self.logger.section_header(
-            f"Waiting for Swarm Round Advancement", self.logger.EMOJIS['hourglass'], 2
-        ))
-        
-        get_logger().info(self.logger.status_line(
-            "Agent Status", f"Blocking for next round ({self.animal_name})", "info"
-        ))
+        get_logger().info(f"{Fore.YELLOW}⏳ [AGENT BLOCK] Waiting for swarm round advancement ({self.animal_name}){Style.RESET_ALL}")
         
         while time.monotonic() - start_time < self.train_timeout:
             curr_time = time.monotonic()
@@ -749,38 +523,28 @@ class CrashSafeSwarmGameManager(BaseGameManager, DefaultGameManagerMixin):
                 round_num, stage = self.coordinator.get_round_and_stage()
             except Exception as e:
                 if curr_time - fetch_log_time > log_timeout:
-                    get_logger().debug(self.logger.status_line(
-                        "Round Fetch", f"Failed: {e}", "warning"
-                    ))
+                    get_logger().debug(f"{Fore.YELLOW}⚠️ [ROUND FETCH] Failed: {e}{Style.RESET_ALL}")
                     fetch_log_time = curr_time
                 time.sleep(check_interval)
                 continue
 
             # Check if we can advance to next round
             if round_num >= self.state.round:
-                get_logger().info(self.logger.status_line(
-                    "Round Advancement", f"Joining round {round_num} {self.logger.EMOJIS['rocket']}", "success"
-                ))
+                get_logger().info(f"{Fore.GREEN}🚀 [ROUND ADVANCE] Joining round {round_num}{Style.RESET_ALL}")
                 check_backoff = check_interval  # Reset backoff
                 self.state.round = round_num
                 return
             else:
-                get_logger().info(self.logger.status_line(
-                    "Round Status", f"Already finished round {round_num}. Next check in {check_backoff}s", "info"
-                ))
+                get_logger().info(f"{Fore.WHITE}ℹ️ [ROUND STATUS] Already finished round {round_num}. Next check in {check_backoff}s{Style.RESET_ALL}")
                 time.sleep(check_backoff)
                 check_backoff = min(check_backoff * 2, max_check_interval)
 
             # Check for final round
             if round_num == self.max_round - 1:
-                get_logger().info(self.logger.status_line(
-                    "Training Complete", f"Reached maximum round: {self.max_round} {self.logger.EMOJIS['celebration']}", "success"
-                ))
+                get_logger().info(f"{Fore.MAGENTA}🎉 [TRAINING COMPLETE] Reached maximum round: {self.max_round}{Style.RESET_ALL}")
                 return
 
-        get_logger().info(self.logger.status_line(
-            "Training Timeout", f"After {self.train_timeout}s {self.logger.EMOJIS['clock']}", "warning"
-        ))
+        get_logger().info(f"{Fore.YELLOW}🕐 [TRAINING TIMEOUT] After {self.train_timeout}s{Style.RESET_ALL}")
 
     def get_comprehensive_health_status(self) -> Dict[str, Any]:
         """Get comprehensive system health status"""
@@ -807,7 +571,7 @@ class CrashSafeSwarmGameManager(BaseGameManager, DefaultGameManagerMixin):
         return status
 
     def _log_system_health(self):
-        """Log system health status periodically with beautiful format"""
+        """Log system health status periodically with clean format"""
         current_time = time.time()
         
         if current_time - self._last_health_log_time < self.health_check_interval:
@@ -826,83 +590,52 @@ class CrashSafeSwarmGameManager(BaseGameManager, DefaultGameManagerMixin):
         emergency_mode = status.get("dht_backend", {}).get("emergency_mode", False)
         dht_mode = status.get("dht_backend", {}).get("mode", "unknown")
         
-        # Create beautiful health status
-        health_content = [
-            f"Phase: {training_phase} {self.logger.EMOJIS['gear']}",
-            f"Mode: {dht_mode} {self.logger.EMOJIS['network']}",
-            f"Restarts: {restart_count} {self.logger.EMOJIS['sync']}"
-        ]
+        # Create clean health status
+        emergency_text = f" | Emergency: {'ACTIVE' if emergency_mode else 'OFF'}" if emergency_mode else ""
         
-        if emergency_mode:
-            health_content.append(f"Emergency Mode: ACTIVE {self.logger.EMOJIS['warning']}")
-        
-        box_message = self.logger.create_box_message(
-            "HEALTH STATUS", health_content, 
-            emoji=self.logger.EMOJIS['heart']
+        get_logger().info(
+            f"{Fore.CYAN}💓 [HEALTH] Phase: {training_phase} | "
+            f"DHT: {dht_mode} | Restarts: {restart_count}{emergency_text}{Style.RESET_ALL}"
         )
         
-        get_logger().info(box_message)
-        
-        if restart_count > 5:
-            get_logger().warning(self.logger.status_line(
-                "High Restart Count", f"{restart_count} restarts detected", "warning"
-            ))
+        if restart_count > 30:
+            get_logger().warning(f"{Fore.YELLOW}⚠️ [HEALTH] High restart count detected: {restart_count}{Style.RESET_ALL}")
 
     def _log_comprehensive_health_status(self):
-        """Log detailed health status with beautiful format"""
+        """Log detailed health status with clean format"""
         if not self.enable_crash_protection:
             return
             
         status = self.get_comprehensive_health_status()
         
-        get_logger().info(self.logger.section_header(
-            "COMPREHENSIVE HEALTH STATUS", self.logger.EMOJIS['shield'], 1
-        ))
+        get_logger().info(f"{Fore.MAGENTA}🛡️ [COMPREHENSIVE HEALTH STATUS]{Style.RESET_ALL}")
         
         # Manager info
         manager_info = status.get("manager_info", {})
-        manager_content = [
-            f"Agent: {manager_info.get('animal_name')} {self.logger.EMOJIS['robot']}",
-            f"Round: {manager_info.get('round')} {self.logger.EMOJIS['trophy']}",
-            f"Points: {manager_info.get('batched_signals')} {self.logger.EMOJIS['gem']}",
-            f"Total Rounds: {manager_info.get('round_counter', 0)} {self.logger.EMOJIS['chart']}"
-        ]
-        
-        manager_box = self.logger.create_box_message(
-            "AGENT STATUS", manager_content, 
-            emoji=self.logger.EMOJIS['robot']
+        get_logger().info(
+            f"{Fore.WHITE}🤖 [AGENT STATUS] Agent: {manager_info.get('animal_name')} | "
+            f"Round: {manager_info.get('round')} | Points: {manager_info.get('batched_signals')} | "
+            f"Total Rounds: {manager_info.get('round_counter', 0)}{Style.RESET_ALL}"
         )
-        get_logger().info(manager_box)
         
         # Training state
         training_state = status.get("training_state", {})
         if training_state:
-            training_content = [
-                f"Current Phase: {training_state.get('current_phase')} {self.logger.EMOJIS['gear']}",
-                f"Total Restarts: {training_state.get('total_restarts', 0)} {self.logger.EMOJIS['sync']}",
-                f"Critical Sections: {training_state.get('critical_sections', 0)} {self.logger.EMOJIS['shield']}"
-            ]
-            
-            training_box = self.logger.create_box_message(
-                "TRAINING STATE", training_content,
-                emoji=self.logger.EMOJIS['brain']
+            get_logger().info(
+                f"{Fore.CYAN}🧠 [TRAINING STATE] Phase: {training_state.get('current_phase', 'unknown')} | "
+                f"Total Restarts: {training_state.get('total_restarts', 0)} | "
+                f"Critical Sections: {training_state.get('critical_sections', 0)}{Style.RESET_ALL}"
             )
-            get_logger().info(training_box)
         
         # DHT status
         dht_backend = status.get("dht_backend", {})
         if dht_backend:
-            dht_content = [
-                f"DHT Mode: {dht_backend.get('mode')} {self.logger.EMOJIS['network']}",
-                f"Emergency Mode: {dht_backend.get('emergency_mode')} {self.logger.EMOJIS['warning'] if dht_backend.get('emergency_mode') else self.logger.EMOJIS['success']}",
-                f"Connection Status: {dht_backend.get('connection_status', 'unknown')} {self.logger.EMOJIS['chain']}"
-            ]
-            
-            dht_box = self.logger.create_box_message(
-                "DHT BACKEND STATUS", dht_content,
-                emoji=self.logger.EMOJIS['network']
+            emergency_status = "ACTIVE" if dht_backend.get('emergency_mode', False) else "OFF"
+            get_logger().info(
+                f"{Fore.BLUE}🌐 [DHT BACKEND] Mode: {dht_backend.get('mode', 'unknown')} | "
+                f"Emergency: {emergency_status} | "
+                f"Connection: {dht_backend.get('connection_status', 'unknown')}{Style.RESET_ALL}"
             )
-            get_logger().info(dht_box)
 
 
 # Backward compatibility alias
@@ -911,7 +644,7 @@ SwarmGameManager = CrashSafeSwarmGameManager
 
 # Factory function for enhanced manager creation
 def create_crash_safe_swarm_manager(**kwargs):
-    """Create SwarmGameManager with crash protection and beautiful logging"""
+    """Create SwarmGameManager with crash protection and clean logging"""
     
     # Set default crash protection parameters
     crash_defaults = {
@@ -930,146 +663,84 @@ def create_crash_safe_swarm_manager(**kwargs):
     return CrashSafeSwarmGameManager(**kwargs)
 
 
-# Emergency control functions with beautiful logging
+# Emergency control functions with clean logging
 def emergency_disable_crash_protection(manager):
-    """Emergency function to disable crash protection with beautiful logging"""
+    """Emergency function to disable crash protection with clean logging"""
     if hasattr(manager, 'enable_crash_protection'):
         manager.enable_crash_protection = False
         
-        if hasattr(manager, 'logger'):
-            get_logger().warning(manager.logger.status_line(
-                "CRASH PROTECTION", "EMERGENCY DISABLED", "error"
-            ))
-        else:
-            get_logger().warning("CRASH PROTECTION EMERGENCY DISABLED")
+        get_logger().warning(f"{Fore.RED}❌ [EMERGENCY] Crash protection DISABLED{Style.RESET_ALL}")
         
         if hasattr(manager.communication, 'auto_restart_enabled'):
             manager.communication.auto_restart_enabled = False
 
 
 def get_system_health_report(manager) -> str:
-    """Get formatted system health report with beautiful format"""
+    """Get formatted system health report with clean format"""
     if not hasattr(manager, 'get_comprehensive_health_status'):
         return "Health monitoring not available"
         
     status = manager.get_comprehensive_health_status()
     
-    if hasattr(manager, 'logger'):
-        logger = manager.logger
+    # Create clean health report
+    report_lines = []
+    
+    # Manager status
+    manager_info = status.get("manager_info", {})
+    report_lines.append(f"🤖 Agent: {manager_info.get('animal_name', 'unknown')}")
+    report_lines.append(f"🏆 Round: {manager_info.get('round', 0)}")
+    report_lines.append(f"💎 Points: {manager_info.get('batched_signals', 0)}")
+    
+    # Training state
+    training_state = status.get("training_state", {})
+    if training_state:
+        report_lines.append(f"⚙️ Phase: {training_state.get('current_phase', 'unknown')}")
+        report_lines.append(f"🔄 Restarts: {training_state.get('total_restarts', 0)}")
+    
+    # DHT status
+    dht_backend = status.get("dht_backend", {})
+    if dht_backend:
+        report_lines.append(f"🌐 DHT Mode: {dht_backend.get('mode', 'unknown')}")
         
-        # Create beautiful health report
-        content = []
-        
-        # Manager status
-        manager_info = status.get("manager_info", {})
-        content.append(f"Agent: {manager_info.get('animal_name', 'unknown')} {logger.EMOJIS['robot']}")
-        content.append(f"Round: {manager_info.get('round', 0)} {logger.EMOJIS['trophy']}")
-        content.append(f"Points: {manager_info.get('batched_signals', 0)} {logger.EMOJIS['gem']}")
-        
-        # Training state
-        training_state = status.get("training_state", {})
-        if training_state:
-            content.append(f"Phase: {training_state.get('current_phase', 'unknown')} {logger.EMOJIS['gear']}")
-            content.append(f"Restarts: {training_state.get('total_restarts', 0)} {logger.EMOJIS['sync']}")
-        
-        # DHT status
-        dht_backend = status.get("dht_backend", {})
-        if dht_backend:
-            content.append(f"DHT Mode: {dht_backend.get('mode', 'unknown')} {logger.EMOJIS['network']}")
-            
-            if dht_backend.get('emergency_mode', False):
-                content.append(f"DHT Emergency Mode: ACTIVE {logger.EMOJIS['warning']}")
-        
-        return logger.create_box_message("SYSTEM HEALTH REPORT", content, emoji=logger.EMOJIS['heart'])
-    else:
-        # Fallback to simple format
-        report = ["=== SYSTEM HEALTH REPORT ==="]
-        
-        # Manager status
-        manager_info = status.get("manager_info", {})
-        report.append(f"Agent: {manager_info.get('animal_name', 'unknown')}")
-        report.append(f"Round: {manager_info.get('round', 0)}")
-        report.append(f"Points: {manager_info.get('batched_signals', 0)}")
-        
-        # Training state
-        training_state = status.get("training_state", {})
-        if training_state:
-            report.append(f"Phase: {training_state.get('current_phase', 'unknown')}")
-            report.append(f"Restarts: {training_state.get('total_restarts', 0)}")
-        
-        # DHT status
-        dht_backend = status.get("dht_backend", {})
-        if dht_backend:
-            report.append(f"DHT Mode: {dht_backend.get('mode', 'unknown')}")
-            
-            if dht_backend.get('emergency_mode', False):
-                report.append("DHT Emergency Mode: ACTIVE")
-        
-        report.append("========================")
-        
-        return "\n".join(report)
+        if dht_backend.get('emergency_mode', False):
+            report_lines.append("⚠️ DHT Emergency Mode: ACTIVE")
+    
+    return "\n".join([f"{Fore.CYAN}=== SYSTEM HEALTH REPORT ==={Style.RESET_ALL}"] + 
+                     [f"{Fore.WHITE}{line}{Style.RESET_ALL}" for line in report_lines] +
+                     [f"{Fore.CYAN}========================{Style.RESET_ALL}"])
 
 
-# Additional utility functions for beautiful logging
+# Additional utility functions for clean logging
 def log_performance_metrics(manager, metrics: Dict[str, Any]):
-    """Log performance metrics with beautiful format"""
-    if not hasattr(manager, 'logger'):
-        get_logger().info(f"Performance Metrics: {metrics}")
-        return
-    
-    logger = manager.logger
-    
-    content = []
+    """Log performance metrics with clean format"""
+    metric_parts = []
     for key, value in metrics.items():
         if isinstance(value, (int, float)):
             if key.lower() in ['accuracy', 'score', 'reward']:
-                emoji = logger.EMOJIS['trophy']
+                emoji = "🏆"
             elif key.lower() in ['time', 'duration', 'latency']:
-                emoji = logger.EMOJIS['clock']
+                emoji = "🕐"
             elif key.lower() in ['memory', 'cpu', 'gpu']:
-                emoji = logger.EMOJIS['gear']
+                emoji = "⚙️"
             else:
-                emoji = logger.EMOJIS['chart']
+                emoji = "📊"
             
-            content.append(f"{key}: {value} {emoji}")
+            metric_parts.append(f"{key}: {value} {emoji}")
         else:
-            content.append(f"{key}: {value}")
+            metric_parts.append(f"{key}: {value}")
     
-    box_message = logger.create_box_message(
-        "PERFORMANCE METRICS", content,
-        emoji=logger.EMOJIS['chart']
-    )
-    
-    get_logger().info(box_message)
+    get_logger().info(f"{Fore.CYAN}📊 [PERFORMANCE] {' | '.join(metric_parts)}{Style.RESET_ALL}")
 
 
 def log_training_progress(manager, current_step: int, total_steps: int, loss: float = None):
-    """Log training progress with beautiful progress bar"""
-    if not hasattr(manager, 'logger'):
-        progress = f"Training Progress: {current_step}/{total_steps}"
-        if loss is not None:
-            progress += f" (Loss: {loss:.4f})"
-        get_logger().info(progress)
-        return
+    """Log training progress with clean progress indication"""
+    percentage = (current_step / total_steps * 100) if total_steps > 0 else 0
     
-    logger = manager.logger
-    
-    # Create progress bar
-    progress_bar = logger.progress_bar(
-        current_step, total_steps, 
-        label=f"{logger.EMOJIS['rocket']} Training Progress"
-    )
-    
-    content = [progress_bar]
+    progress_parts = [f"Step {current_step}/{total_steps} ({percentage:.1f}%)"]
     
     if loss is not None:
-        content.append(f"Current Loss: {loss:.4f} {logger.EMOJIS['chart']}")
+        progress_parts.append(f"Loss: {loss:.4f}")
     
-    content.append(f"Agent: {manager.animal_name} {logger.EMOJIS['robot']}")
+    progress_parts.append(f"Agent: {manager.animal_name}")
     
-    box_message = logger.create_box_message(
-        "TRAINING PROGRESS", content,
-        emoji=logger.EMOJIS['brain']
-    )
-    
-    get_logger().info(box_message)
+    get_logger().info(f"{Fore.BLUE}🚀 [TRAINING PROGRESS] {' | '.join(progress_parts)}{Style.RESET_ALL}")
