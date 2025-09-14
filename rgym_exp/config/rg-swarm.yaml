@@ -123,7 +123,7 @@ game_manager:
     enable_robust_mode: true
     health_check_interval: 60
     max_pipe_errors: 5
-    world_size: 12
+    world_size: 8
   coordinator:
     _target_: rgym_exp.src.coordinator.ModalSwarmCoordinator
     web3_url: ${blockchain.alchemy_url}
