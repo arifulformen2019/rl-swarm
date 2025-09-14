@@ -78,7 +78,6 @@ game_manager:
         pretrained_model_name_or_path: ${oc.env:MODEL_NAME,Qwen/Qwen2.5-3B-Instruct}
         device_map: auto
         torch_dtype: ${training.dtype}
-        gradient_checkpointing: true
         quantization_config:
           _target_: transformers.BitsAndBytesConfig
           load_in_4bit: true
@@ -95,8 +94,8 @@ game_manager:
       epsilon: 0.2
       epsilon_high: 0.28
       num_generations: ${training.num_generations}
-      gradient_accumulation_steps: 2
-      per_device_train_batch_size: 2
+      enable_gradient_checkpointing: true
+      max_new_tokens: 128
     log_with: wandb
     log_dir: ${log_dir}
     judge_base_url: ${eval.judge_base_url}
