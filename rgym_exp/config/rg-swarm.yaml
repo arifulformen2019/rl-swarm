@@ -53,7 +53,7 @@ game_manager:
   prg_game_config: ${prg_game_config}
   enable_crash_protection: true
   enable_dht_auto_restart: true
-  memory_threshold_mb: 10000
+  memory_threshold_mb: 11000
   restart_interval_minutes: 60
   max_auto_restarts: 150
   health_check_interval: 60
@@ -115,12 +115,12 @@ game_manager:
     startup_timeout: 120
     dht_timeout_minutes: 3610
     beam_size: 10
-    world_size: 10
+    world_size: None
     disable_caching: true
     cache_locally: false
     cache_on_store: false
     auto_restart_enabled: ${oc.env:AUTO_RESTART_ENABLED,true}
-    memory_threshold_mb: 10000
+    memory_threshold_mb: 11000
     restart_interval_minutes: 60
     max_auto_restarts: 150
     enable_robust_mode: true
