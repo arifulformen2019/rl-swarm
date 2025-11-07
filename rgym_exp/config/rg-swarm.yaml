@@ -75,7 +75,7 @@ game_manager:
     _target_: rgym_exp.src.trainer.GRPOTrainerModule
     models:
       - _target_: transformers.AutoModelForCausalLM.from_pretrained
-        pretrained_model_name_or_path: ${oc.env:MODEL_NAME,Gensyn/Qwen2.5-1.5B-Instruct}
+        pretrained_model_name_or_path: ${oc.env:MODEL_NAME,Qwen/Qwen2.5-3B-Instruct}
         device_map: auto
         torch_dtype: ${training.dtype}
         quantization_config:
@@ -86,7 +86,7 @@ game_manager:
           bnb_4bit_quant_type: nf4
     tokenizer:
       _target_: transformers.AutoTokenizer.from_pretrained
-      pretrained_model_name_or_path: ${oc.env:MODEL_NAME,Gensyn/Qwen2.5-1.5B-Instruct}
+      pretrained_model_name_or_path: ${oc.env:MODEL_NAME,Qwen/Qwen2.5-3B-Instruct}
       use_fast: true
     config:
       _target_: genrl.trainer.grpo_trainer.GRPOTrainerConfig
