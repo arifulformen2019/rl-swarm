@@ -31,7 +31,7 @@ class GRPOTrainerModule(GRPOLanguageTrainerModule, LoggerMixin):
     """
     Trainer for the Group Relative Policy Optimization (GRPO) method.
     Implements the TrainerModule interface defined in base_trainer.py.
-    With 4-bit quantization support for memory efficiency.
+    With 4-bit quantization support and aggressive memory management.
     """
 
     def __init__(self, models: List[Any], **kwargs):
@@ -42,6 +42,18 @@ class GRPOTrainerModule(GRPOLanguageTrainerModule, LoggerMixin):
             models: List containing the model to be trained.
             **kwargs: Additional arguments for configuration.
         """
+        # Memory management settings
+        self.memory_cleanup_frequency = kwargs.get("memory_cleanup_frequency", 1)  # Clean every step
+        self.max_memory_gb = kwargs.get("max_memory_gb", 6.0)  # Target max VRAM usage
+        self.step_counter = 0
+        self.enable_aggressive_cleanup = kwargs.get("enable_aggressive_cleanup", True)
+        
+        # Track initial memory
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+            initial_memory = torch.cuda.memory_allocated() / 1024**3
+            get_logger().info(f"Initial GPU memory: {initial_memory:.2f} GB")
+        
         # Check and fix quantization for existing models
         if models:
             for i, model in enumerate(models):
@@ -84,6 +96,9 @@ class GRPOTrainerModule(GRPOLanguageTrainerModule, LoggerMixin):
         super().__init__(models, **kwargs)
         judge_base_url = kwargs.get("judge_base_url", None)
         self.judge_client = JudgeClient(judge_base_url) if judge_base_url else None
+        
+        # Force initial cleanup
+        self._aggressive_memory_cleanup()
 
     def _is_model_quantized(self, model) -> bool:
         """
@@ -140,6 +155,7 @@ class GRPOTrainerModule(GRPOLanguageTrainerModule, LoggerMixin):
         del model
         gc.collect()
         torch.cuda.empty_cache()
+        torch.cuda.synchronize()
         
         # Create quantization config
         bnb_config = BitsAndBytesConfig(
@@ -160,13 +176,80 @@ class GRPOTrainerModule(GRPOLanguageTrainerModule, LoggerMixin):
         get_logger().info(f"Model {model_name} reloaded with 4-bit quantization")
         return new_model
 
+    def _get_memory_stats(self):
+        """Get current GPU memory statistics"""
+        if not torch.cuda.is_available():
+            return None
+        
+        allocated = torch.cuda.memory_allocated() / 1024**3
+        reserved = torch.cuda.memory_reserved() / 1024**3
+        max_allocated = torch.cuda.max_memory_allocated() / 1024**3
+        
+        return {
+            'allocated': allocated,
+            'reserved': reserved,
+            'max_allocated': max_allocated
+        }
+
+    def _log_memory_stats(self, stage=""):
+        """Log memory statistics"""
+        stats = self._get_memory_stats()
+        if stats:
+            get_logger().info(
+                f"[{stage}] GPU Memory - "
+                f"Allocated: {stats['allocated']:.2f}GB, "
+                f"Reserved: {stats['reserved']:.2f}GB, "
+                f"Peak: {stats['max_allocated']:.2f}GB"
+            )
+
+    def _aggressive_memory_cleanup(self):
+        """Aggressively clean up GPU memory"""
+        if not torch.cuda.is_available():
+            return
+        
+        # Clear gradients
+        if hasattr(self, 'model') and self.model is not None:
+            for param in self.model.parameters():
+                if param.grad is not None:
+                    param.grad = None
+        
+        # Python garbage collection
+        gc.collect()
+        
+        # Empty CUDA cache
+        torch.cuda.empty_cache()
+        
+        # Synchronize to ensure cleanup is complete
+        torch.cuda.synchronize()
+
     def _smart_cache_clear(self):
-        """Clear cache only when memory usage is high"""
-        if torch.cuda.is_available():
-            allocated_gb = torch.cuda.memory_allocated() / 1024**3
-            if allocated_gb > 5.5:
-                torch.cuda.empty_cache()
-                get_logger().debug(f"Cache cleared - Memory allocated: {allocated_gb:.2f} GB")
+        """Clear cache based on memory usage"""
+        if not torch.cuda.is_available():
+            return
+            
+        stats = self._get_memory_stats()
+        if stats is None:
+            return
+        
+        # Always clean if above threshold
+        if stats['allocated'] > self.max_memory_gb:
+            get_logger().warning(
+                f"Memory usage high ({stats['allocated']:.2f}GB > {self.max_memory_gb}GB), "
+                f"performing aggressive cleanup..."
+            )
+            self._aggressive_memory_cleanup()
+            
+            # Log after cleanup
+            new_stats = self._get_memory_stats()
+            if new_stats:
+                get_logger().info(
+                    f"After cleanup: {new_stats['allocated']:.2f}GB "
+                    f"(freed {stats['allocated'] - new_stats['allocated']:.2f}GB)"
+                )
+        
+        # Periodic cleanup based on frequency
+        elif self.enable_aggressive_cleanup and self.step_counter % self.memory_cleanup_frequency == 0:
+            self._aggressive_memory_cleanup()
 
     def _initialize_model(self, enable_gradient_checkpointing: bool = False):
         """
@@ -190,12 +273,37 @@ class GRPOTrainerModule(GRPOLanguageTrainerModule, LoggerMixin):
             self.model.gradient_checkpointing_enable()
             get_logger().info("Gradient checkpointing enabled")
 
+    def train_step(self, *args, **kwargs):
+        """
+        Override train_step to add memory cleanup
+        """
+        self.step_counter += 1
+        
+        # Log memory before training
+        if self.step_counter % 100 == 0:
+            self._log_memory_stats(f"Before Step {self.step_counter}")
+        
+        # Call parent train_step
+        result = super().train_step(*args, **kwargs)
+        
+        # Clean memory after step
+        self._smart_cache_clear()
+        
+        # Log memory after training
+        if self.step_counter % 100 == 0:
+            self._log_memory_stats(f"After Step {self.step_counter}")
+        
+        return result
+
     @torch.no_grad()
     def evaluate(
         self, state: GameState, data_manager: DataManager, reward_manager: RewardManager
     ):
         if not self.judge_client:
             return
+        
+        # Log memory before evaluation
+        self._log_memory_stats("Before Evaluate")
             
         try:
             model_name = self.model.name_or_path
@@ -230,8 +338,9 @@ class GRPOTrainerModule(GRPOLanguageTrainerModule, LoggerMixin):
             outputs[0], skip_special_tokens=True
         )
         
-        # Clear cache after generation
-        self._smart_cache_clear()
+        # Clean up immediately after generation
+        del input_ids, outputs
+        self._aggressive_memory_cleanup()
         
         # Submit answer to judge service
         self.judge_client.submit_answer(
@@ -239,6 +348,9 @@ class GRPOTrainerModule(GRPOLanguageTrainerModule, LoggerMixin):
             round_number=state.round,
             user_answer=answer
         )
+        
+        # Log memory after evaluation
+        self._log_memory_stats("After Evaluate")
 
     @torch.no_grad()
     def play_prg_game_logits(
@@ -246,6 +358,9 @@ class GRPOTrainerModule(GRPOLanguageTrainerModule, LoggerMixin):
     ) -> dict:
         if not self.judge_client:
             return {'status': PRGGameStatus.ERROR}
+
+        # Log memory before PRG game
+        self._log_memory_stats("Before PRG Game")
 
         # Get current clue from judge service
         game_clue_dict = self.judge_client.get_current_clue()
@@ -296,8 +411,12 @@ class GRPOTrainerModule(GRPOLanguageTrainerModule, LoggerMixin):
             # Select the choice with highest probability
             choice_idx = torch.argmax(choice_logits).item()
             
-            # Clear cache after computation
-            torch.cuda.empty_cache()
+            # Clean up immediately after computation
+            del input_ids, choice_logits
+            self._aggressive_memory_cleanup()
+            
+            # Log memory after PRG game
+            self._log_memory_stats("After PRG Game")
             
             return {
                 "game_idx": game_id,
@@ -310,6 +429,8 @@ class GRPOTrainerModule(GRPOLanguageTrainerModule, LoggerMixin):
 
         except Exception as e:
             get_logger().info(f"Error while computing logits for choices: {e}")
+            # Clean up on error too
+            self._aggressive_memory_cleanup()
             return {'status': PRGGameStatus.ERROR}
 
     def _get_choice_logits(self, input_ids: torch.Tensor, choices: List[str]) -> torch.Tensor:
@@ -342,6 +463,33 @@ class GRPOTrainerModule(GRPOLanguageTrainerModule, LoggerMixin):
 
             total_log_prob = -outputs.loss * choice_ids.size(1)
             logits_list.append(total_log_prob)
+            
+            # Clean up intermediate tensors
+            del choice_ids, seq, labels, outputs
 
         # stack into a single tensor of shape (num_choices,)
-        return torch.stack(logits_list)
+        result = torch.stack(logits_list)
+        
+        # Clean up list
+        del logits_list
+        
+        return result
+
+    def cleanup(self):
+        """Cleanup method for proper shutdown"""
+        get_logger().info("Cleaning up trainer resources...")
+        
+        # Final memory stats
+        self._log_memory_stats("Final Cleanup")
+        
+        # Aggressive cleanup
+        self._aggressive_memory_cleanup()
+        
+        get_logger().info("Trainer cleanup complete")
+
+    def __del__(self):
+        """Ensure cleanup on deletion"""
+        try:
+            self.cleanup()
+        except:
+            pass
