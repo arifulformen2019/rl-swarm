@@ -418,15 +418,9 @@ handle_interrupt() {
 
 cleanup() {
     log_info "Shutting down trainer..."
-    
-    # Remove modal credentials if they exist
-    rm -r "$ROOT/modal-login/temp-data"/*.json 2> /dev/null || true
-    
     cleanup_server
-    
     # Kill all processes belonging to this script's process group
     kill -- -$$ 2>/dev/null || true
-    
     exit 0
 }
 
