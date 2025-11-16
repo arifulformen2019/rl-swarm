@@ -21,7 +21,7 @@ training:
   max_new_tokens: 256
 
 reward_config:
-  ollama_model: qwen2.5-coder:1.5b-instruct
+  ollama_model: qwen2.5-coder:0.5b-instruct
   temperature: 0.0
   num_predict: 256
 
